@@ -128,7 +128,7 @@ Adapting the wording spec section 12.2 pre-approved:
 > chunked prefill, a radix-trie prefix cache, and an OpenAI-compatible API.
 > Validated the scheduler and allocator with a deterministic simulation testing
 > harness (TigerBeetle/FoundationDB style) under adversarial fault injection:
-> thousands of seeds, seven invariants checked every step, every failure replayable
+> 50,000 seeds, seven invariants checked every step, every failure replayable
 > from its seed. **The harness found 15 real bugs**, including a
 > copy-on-write accounting error that overshot the memory watermark and six
 > distinct admission/eviction livelocks — all documented with reproductions in

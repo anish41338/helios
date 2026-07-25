@@ -59,21 +59,18 @@ were livelocks, not corruption.
 ## Result
 
 ```
-2,500 seeds — 0 failures   (verified on the current commit)
+50,000 seeds — 0 failures   (3,807 s single-threaded)
 ```
-
-A 50,000-seed run is in progress; this figure will be raised only when its
-artifact exists. Spec §19.3: no claim without a reproducing command and a
-recorded result.
 
 Reproduce (about 25 minutes single-threaded):
 
 ```bash
-python -m helios.cli vopr --seeds 2500
+python -m helios.cli vopr --seeds 50000 --progress-every 10000 \n    --json-out artifacts/dst_50k.json
 ```
 
-Artifacts: `artifacts/dst_20k.log` (20,000 seeds, earlier commit),
-`artifacts/dst_50k.log` (in progress).
+Artifacts: `artifacts/dst_50k.log` and `artifacts/dst_50k.json` (current core),
+`artifacts/dst_20k.log` (20,000 seeds on an earlier commit, before the
+copy-on-write fork coverage was added).
 
 ## Bugs found
 
@@ -209,6 +206,5 @@ Stated plainly, since the point of DST is credibility:
   kinds are injected but the transport itself is untested. See `docs/SCOPE.md`.
 - Fault injection is at step granularity, not instruction granularity. A real
   VOPR would also interleave partial writes.
-- 2,500 verified seeds is not 1,000,000 (the spec's target). The seed space is
-  explored,
+- 50,000 seeds is not 1,000,000 (the spec's target). The seed space is explored,
   not exhausted; the sweep is trivially extendable with `--seeds`.

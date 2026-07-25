@@ -97,7 +97,58 @@ def cmd_vopr(args: argparse.Namespace) -> int:
         print(
             f"    reproduce: python -m helios.cli vopr --seed {f.seed} --replay"
         )
+
+    if args.json_out:
+        _write_vopr_artifact(args, passed, failures)
     return 0 if not failures else 1
+
+
+def _write_vopr_artifact(args, passed: int, failures) -> None:
+    """Record the sweep result with its provenance.
+
+    Spec section 19.3: no claim without a reproducing command and a recorded
+    result. Writing this from the CLI (rather than an ad-hoc script) is what
+    makes the commit SHA reliably present -- a hand-rolled one-liner silently
+    recorded "unknown" once, which is exactly the kind of gap that turns a
+    documented number into an unverifiable one.
+    """
+    import json
+    import platform
+    import subprocess
+    import time
+    from pathlib import Path
+
+    try:
+        commit = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        commit = "unknown"
+
+    record = {
+        "seeds": args.seeds,
+        "start_seed": args.start,
+        "passed": passed,
+        "failures": [f.summary() for f in failures],
+        "max_steps": args.max_steps,
+        "commit": commit,
+        "platform": platform.platform(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "command": (
+            f"python -m helios.cli vopr --seeds {args.seeds} "
+            f"--start {args.start} --max-steps {args.max_steps}"
+        ),
+    }
+    out = Path(args.json_out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    print(f"wrote {out}")
 
 
 def cmd_make_toy_model(args: argparse.Namespace) -> int:
@@ -192,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=4000)
     p.add_argument("--stop-on-fail", action="store_true")
     p.add_argument("--progress-every", type=int, default=1000)
+    p.add_argument(
+        "--json-out",
+        default=None,
+        help="write the sweep result + provenance to this JSON path",
+    )
     p.set_defaults(func=cmd_vopr)
 
     p = sub.add_parser("make-toy-model", help="write a small random-weight model")
