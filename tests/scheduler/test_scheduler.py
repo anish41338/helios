@@ -390,6 +390,31 @@ def test_dst_seeds_pass(seed: int):
     assert result.ok, f"seed {seed}: {result.violations}"
 
 
+def test_dst_harness_exercises_copy_on_write():
+    """The harness must actually reach the CoW path, not just claim to.
+
+    Copy-on-write is where spec section 5.3 says the classic corruption bug
+    lives, and where DST BUG-003 lived. Coverage measurement once showed 0/300
+    seeds reaching it: the prefix cache shares only whole blocks, so nothing
+    ever wrote into a shared *partially filled* tail. `_maybe_fork` exists to
+    close that gap, and this test fails if it stops working.
+    """
+    total_copies = 0
+    seeds_with_cow = 0
+    for seed in range(12):
+        sim = Simulation(seed, max_steps=600)
+        sim.run()
+        if sim.allocator.cow_copies:
+            seeds_with_cow += 1
+        total_copies += sim.allocator.cow_copies
+
+    assert seeds_with_cow >= 10, (
+        f"only {seeds_with_cow}/12 seeds exercised copy-on-write; the harness "
+        f"is not covering the path BUG-003 lived in"
+    )
+    assert total_copies > 0
+
+
 def test_dst_replay_is_deterministic():
     a = Simulation(31337, max_steps=600).run()
     b = Simulation(31337, max_steps=600).run()

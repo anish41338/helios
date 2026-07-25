@@ -122,6 +122,78 @@ turns a 4000-step liveness timeout into an immediate, localized failure:
 - every sequence is reachable from a queue (BUG-013)
 - cache pins are attributable to a live sequence (BUG-007/011)
 
+## Auditing the harness itself
+
+A harness that does not exercise a path proves nothing about it, so coverage was
+measured rather than assumed. Instrumenting 300 seeds gave:
+
+| path | seeds reaching it |
+|---|---|
+| empty steps | 299/300 |
+| recompute preemption | 271/300 |
+| executor faults | 252/300 |
+| cancellation | 242/300 |
+| prefix-cache hit | 201/300 |
+| cache eviction | 153/300 |
+| speculation | 145/300 |
+| swap preemption | 7/300 |
+| **copy-on-write** | **0/300** |
+
+Copy-on-write — the path spec §5.3 names as the classic corruption bug, and where
+BUG-003 actually lived — was reached by **zero** seeds. The reason is structural,
+not statistical: the prefix cache shares only *whole* blocks, so no sequence ever
+writes into a shared **partially-filled** tail. Reaching that state needs `fork`
+(beam search / parallel sampling, `n > 1`), which the engine does not expose.
+
+So the original 20,000-seed run, despite passing, said nothing about CoW. BUG-003
+was found by a different route (an I7 violation via the scheduler) and would not
+have been caught by the harness as it stood.
+
+`_maybe_fork` now forks a running sequence's block table and appends a token to
+it, modelling parallel sampling (`n > 1`) at the allocator level. The fork must
+**write**, not merely exist, or the shared tail is never dirtied. Coverage went
+0/300 → **120/120 seeds, ~2,750 copies per 120 seeds**.
+
+The verification that matters is not the coverage number but **reintroducing
+BUG-003 and confirming the harness fails**:
+
+```
+BUG-003 reintroduced, forks freed same-step:  300/300 passed   <- missed it
+BUG-003 reintroduced, forks persisted:        269/400 passed   <- caught it
+    seed 7, step 21: I7: committed 59 > usable 58
+```
+
+Making forks *persist* across steps caught the bug — and then had to be
+**reverted anyway**. A forked table is invisible to the scheduler: it can neither
+evict nor preempt one, so a persisted shadow starves admission and reports a
+liveness failure that belongs to the harness rather than the engine (~60 spurious
+failures per 600 seeds, each looking exactly like a real livelock). Several
+attempts to keep persistence safe — bounding lifetime, capping count, forking
+only when memory is ample — all still produced spurious failures, because *any*
+invisible memory consumer can starve admission.
+
+So the harness keeps same-step forks (full CoW coverage, no artificial
+starvation), and the watermark-overshoot case is pinned instead by
+`tests/allocator/test_allocator.py::test_cow_is_accounted_in_capacity_check`,
+which sets the pool to exactly the watermark deliberately. That is the right home
+for a test needing exact control of global state; a randomised harness reaches it
+only by luck.
+
+Two lessons worth stating, since both cost real time here:
+
+- **Coverage is not detection.** Same-step forks gave "full CoW coverage" while
+  still failing to catch BUG-003. Only fault injection into the *code under test*
+  proved what the harness could see.
+- **A harness artifact is indistinguishable from a real bug in the report.** The
+  spurious liveness failures looked identical to BUG-006/014. Distinguishing them
+  required checking whether the blocked memory was owned by something the
+  scheduler could actually reclaim.
+
+Swap preemption at 7/300 remains thin. It requires
+`generated_len > 4 × prompt_len` *and* an enabled host tier, which the random
+workloads rarely produce together; it is covered directly by
+`tests/allocator/test_allocator.py` instead.
+
 ## Limitations of this harness
 
 Stated plainly, since the point of DST is credibility:

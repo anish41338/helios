@@ -21,7 +21,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from .allocator import Allocator, InvariantViolation
+from .allocator import AllocError, Allocator, InvariantViolation
 from .execstep import (
     ExecFault,
     ExecOutputs,
@@ -257,6 +257,15 @@ class Simulation:
             faults=self.faults,
         )
 
+        # Separate RNG stream so adding fork events cannot shift the
+        # workload or fault schedules derived from the main stream.
+        self.fork_rng = random.Random(seed ^ 0xF00D)
+
+        # Forked block tables held across steps (see _maybe_fork). These are a
+        # harness artifact and are released before the leak check.
+        # Forked tables are created and freed within a single step; see
+        # _maybe_fork for why they must not persist.
+
         self.trace: List[Dict[str, object]] = []
         self.submitted: Dict[int, SeqId] = {}   # request index -> seq_id
         self.steps_taken = 0
@@ -372,6 +381,62 @@ class Simulation:
 
     # ------------------------------------------------------------------- run
 
+    def _maybe_fork(self, step: int) -> None:
+        """Occasionally fork a running sequence's block table, then write to it.
+
+        This exists to reach the copy-on-write path, which is otherwise
+        STRUCTURALLY UNREACHABLE in simulation: the prefix cache shares only
+        whole blocks, so no sequence ever writes into a shared *partially
+        filled* tail -- exactly the case spec section 5.3 names as the classic
+        corruption bug, and exactly where BUG-003 lived. Coverage measurement
+        showed 0/300 seeds exercising it before this was added.
+
+        A fork models beam search / parallel sampling (`n > 1`), which the
+        engine does not expose yet. The forked table is a scheduler-invisible
+        shadow: it is created, appended to (forcing CoW), and freed here, so it
+        tests the allocator's sharing logic without inventing scheduler
+        semantics that do not exist.
+        """
+        if not self.adversarial or not self.scheduler.running:
+            return
+        if self.fork_rng.random() > 0.15:
+            return
+
+
+        alloc = self.allocator
+        parent = self.scheduler.running[self.fork_rng.randrange(len(self.scheduler.running))]
+        table = alloc.block_table(parent.seq_id)
+        if table is None or not table.blocks:
+            return
+
+        # The fork lives for exactly this step. Holding it longer was tried and
+        # reverted: the scheduler has no knowledge of these tables, so it can
+        # neither evict nor preempt them, and a persisted shadow starves
+        # admission and reports a liveness failure that belongs to the harness
+        # rather than the engine (it cost ~60 spurious failures per 600 seeds).
+        # Same-step forks still reach the CoW-at-the-watermark condition
+        # whenever the scheduler happens to sit at the watermark; the case is
+        # additionally pinned deterministically by
+        # tests/allocator/test_allocator.py::test_cow_is_accounted_in_capacity_check,
+        # which is the right place for a test that needs exact control of the
+        # pool state.
+        shadow_id = -(step + 1)  # negative ids cannot collide with real seq ids
+        try:
+            alloc.fork(parent.seq_id, shadow_id)
+        except (ValueError, KeyError):
+            return
+
+        try:
+            # Writing one token forces a CoW of the shared tail when that tail
+            # is partially filled -- the case that matters.
+            alloc.append_tokens(shadow_id, 1)
+        except AllocError:
+            pass
+
+        alloc.free(shadow_id)
+        # The executor never saw these blocks, so drop the copy requests.
+        alloc.drain_pending_copies()
+
     def run(self) -> "SimResult":
         """Drive the scheduler to quiescence, asserting invariants throughout."""
         arrivals_by_step: Dict[int, List[Tuple[int, Request]]] = {}
@@ -399,6 +464,8 @@ class Simulation:
 
             self.scheduler.step(self.executor)
             self.steps_taken = step + 1
+
+            self._maybe_fork(step)
 
             if self.check_every_step:
                 try:
