@@ -48,8 +48,10 @@ I/O, no threads, no unseeded RNG, no iteration over unordered containers. That
 lets the whole system be driven from a seed under adversarial fault injection,
 single-threaded, asserting every invariant after every step.
 
-**50,000 seeds, 0 failures** (3,807 s single-threaded; artifact in
-`artifacts/dst_50k.json`). Any failure replays exactly:
+**50,000 seeds, 0 failures** (3,807 s single-threaded), plus **20,000 re-verified
+on the current commit** after the executor rewrite — artifacts in
+`artifacts/dst_50k.json` and `artifacts/dst_20k_final.json`. Any failure replays
+exactly:
 
 ```bash
 PYTHONPATH=python python -m helios.cli vopr --seed 918273 --replay

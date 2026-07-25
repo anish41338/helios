@@ -60,7 +60,15 @@ were livelocks, not corruption.
 
 ```
 50,000 seeds — 0 failures   (3,807 s single-threaded)
+20,000 seeds — 0 failures   (re-verified on the current commit, after the
+                             executor was rewritten to batch decode/prefill)
 ```
+
+The 20,000-seed run's artifact records the commit it measured
+(`artifacts/dst_20k_final.json`); the 50,000-seed one predates the CLI's
+provenance flag and is annotated with its launch commit by hand. Both matter
+because the executor changed substantially between them -- though not the
+scheduler, which is what the harness actually drives.
 
 Reproduce (about 25 minutes single-threaded):
 
@@ -68,9 +76,9 @@ Reproduce (about 25 minutes single-threaded):
 python -m helios.cli vopr --seeds 50000 --progress-every 10000 \n    --json-out artifacts/dst_50k.json
 ```
 
-Artifacts: `artifacts/dst_50k.log` and `artifacts/dst_50k.json` (current core),
-`artifacts/dst_20k.log` (20,000 seeds on an earlier commit, before the
-copy-on-write fork coverage was added).
+Artifacts: `artifacts/dst_20k_final.json` (20,000 seeds, commit-stamped),
+`artifacts/dst_50k.log` + `.json` (50,000 seeds), and `artifacts/dst_20k.log`
+(an earlier run, before the copy-on-write fork coverage existed).
 
 ## Bugs found
 

@@ -1,0 +1,8 @@
+running seeds [0, 20000) max_steps=4000
+  ... 5000/20000 seeds, 0 failures
+  ... 10000/20000 seeds, 0 failures
+  ... 15000/20000 seeds, 0 failures
+  ... 20000/20000 seeds, 0 failures
+
+20000/20000 seeds passed, 0 failed
+wrote artifacts\dst_20k_final.json
