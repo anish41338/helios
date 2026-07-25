@@ -1,12 +1,14 @@
 """Triton paged-attention kernel (spec section 8.3).
 
-STATUS: WRITTEN, NOT YET VERIFIED ON HARDWARE.
+STATUS: VERIFIED on a Tesla T4 (sm_75, CUDA 12.8, Triton 3.6.0, torch 2.10.0).
 
-This file was authored on a machine with no NVIDIA GPU. It is syntactically
-checked and its host-side logic is exercised by the CPU test suite (which skips
-the kernel itself), but **no claim may be made about it until
-tests/parity/test_triton_parity.py passes on a real device**. See docs/GPU.md
-for the exact command. Spec section 19.3: no claim without a reproducing run.
+    9/9 tests/parity/test_triton_parity.py passed
+    paged decode @ 32 seqs x 512 ctx: pytorch 14.089 ms -> triton 2.676 ms
+    speedup 5.26x
+
+Authored on a machine with no NVIDIA GPU and marked unverified until that run;
+the parity gate is what promoted it (spec section 19.3). Re-run it on any new
+device before trusting the numbers -- they are specific to sm_75.
 
 Why a kernel at all: the PyTorch fallback in paged_attn.py gathers a sequence's
 scattered KV blocks into a contiguous tensor before computing scores. That

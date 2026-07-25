@@ -39,8 +39,16 @@ def banner(msg: str) -> None:
 
 
 def run(cmd: list[str], cwd: Path = ROOT) -> tuple[int, str]:
+    # Child processes need `helios` importable. The package lives under python/
+    # and is not pip-installed here, so PYTHONPATH is set explicitly -- omitting
+    # it silently skipped toy-model creation and cascaded into three failed
+    # benchmark suites on the first real T4 run.
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run(
-        cmd, cwd=str(cwd), capture_output=True, text=True
+        cmd, cwd=str(cwd), capture_output=True, text=True, env=env
     )
     out = proc.stdout + proc.stderr
     print(out[-4000:], flush=True)
@@ -141,35 +149,30 @@ def main() -> int:
             local = None
     if local and (local / "config.json").exists():
         rc, out = run([
-            sys.executable, "-c",
-            "import sys; sys.path.insert(0, r'%s');"
-            "from helios.engine import LLMEngine, EngineConfig;"
-            "from helios.core.types import SamplingParams;"
-            "e=LLMEngine(EngineConfig(model_dir=r'%s', device='cuda',"
-            " kv_cache_bytes=4*1024**3, block_size=16, max_model_len=2048));"
-            "print('prompt:', 'The capital of France is');"
-            "o=e.generate(['The capital of France is'],"
-            " SamplingParams(max_tokens=24, temperature=0.0))[0];"
-            "print('OUTPUT:', repr(o.text))"
-            % (ROOT / "python", local),
+            sys.executable, "bench/real_model_check.py",
+            "--model", str(local), "--device", "cuda",
+            "--kv-mb", "2048", "--max-tokens", "24", "--max-model-len", "1024",
         ])
         record["real_model_ran"] = rc == 0
-        # A real model producing coherent text is the strongest single signal
-        # that the whole stack -- paging, RoPE, GQA, sampling -- is correct.
         for line in out.splitlines():
-            if line.startswith("OUTPUT:"):
-                record["real_model_output"] = line
-                print(f"  >>> {line}")
+            if line.strip().startswith("text:") or "tok/s" in line:
+                record.setdefault("real_model_lines", []).append(line.strip())
 
     banner("5. BENCHMARK SUITE ON GPU")
     bench_model = ROOT / "artifacts" / "bench_model"
     if not (bench_model / "config.json").exists():
         run([sys.executable, "-m", "helios.cli", "make-toy-model",
              "--out", str(bench_model)])
-    for suite in ("all", "prefill-heavy", "prefix-cache"):
-        run([sys.executable, "bench/loadgen.py", "--model", str(bench_model),
-             "--suite", suite, "--requests", "32", "--out", "artifacts"])
-    run([sys.executable, "bench/report.py"])
+    if not (bench_model / "config.json").exists():
+        print("  could not create the benchmark model; skipping step 5")
+        record["benchmarks_ran"] = False
+        bench_model = None
+    if bench_model is not None:
+        for suite in ("all", "prefill-heavy", "prefix-cache"):
+            run([sys.executable, "bench/loadgen.py", "--model", str(bench_model),
+                 "--suite", suite, "--requests", "32", "--out", "artifacts"])
+        run([sys.executable, "bench/report.py"])
+        record["benchmarks_ran"] = True
 
     out_path = ROOT / "artifacts" / "gpu_run.json"
     out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")

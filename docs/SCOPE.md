@@ -37,6 +37,7 @@ could never be compiled, run, or benchmarked here.
 | RadixTrie prefix cache | 3 | Built, block-aligned, LRU eviction |
 | Paged attention | 8.3 | Built as gather+SDPA (the spec's fallback path) |
 | Batched paged decode attention | 8.3 | Built (vectorised over sequences, padded + masked) |
+| **Triton fused paged-attention kernel** | 8.3 | **Built and verified on a T4: 5.26x over the PyTorch path**, 9/9 parity tests |
 | Llama/Qwen2 architecture (GQA, RoPE, SwiGLU, RMSNorm) | 8.1 | Built from scratch |
 | safetensors loading | 8.2 | Built (fp32/fp16) |
 | Sampling (greedy, temp, top-k, top-p, per-request seeds) | 9.1 | Built |
@@ -53,7 +54,6 @@ could never be compiled, run, or benchmarked here.
 | Missing | Spec section | Why |
 |---|---|---|
 | **Rust frontend + scheduler** | 3, 4 | Cut by section 12.2. Everything is Python |
-| **Triton/CUDA paged-attention kernel** | 8.3 | **Written but UNVERIFIED** -- no GPU here to compile or validate it. See `docs/GPU.md`; the parity gate promotes it |
 | **W4A16 / AWQ / GPTQ quantization** | 8.2 | Needs GPU kernels to be meaningful |
 | **W4A4 draft path — the "QA" in QASSD** | 7.1 | Same. This is the core novelty claim and **it is not implemented** |
 | **Quantized KV shadow / dual-buffer** | 7.4 | Same |
@@ -99,7 +99,9 @@ Measured on this CPU, with the mechanism ablated and nothing else changed:
 | `baseline_hf_loop` (no engine, no KV reuse) | 71.6 |
 
 **2.24× from decode batching alone**, and continuous batching beats static
-batching by 1.13×. Mean resident decode batch was 11.6 (max 24) — reported
+batching by 1.13×. On a Tesla T4, the fused Triton kernel is a further **5.26×**
+over this PyTorch path for paged decode attention (32 seqs × 512 ctx), verified
+by 9/9 parity tests against it. Mean resident decode batch was 11.6 (max 24) — reported
 because the win is proportional to it. Prefill batching (1.16× TTFT) and the
 prefix cache (1.49× throughput) are measured on their own regimes; see
 `BENCHMARKS.md`.

@@ -75,6 +75,7 @@ def load_model(
 
     own = dict(model.named_parameters())
     assigned: set[str] = set()
+    ignored: list[str] = []
 
     for shard in _iter_shards(model_dir):
         # framework="pt" with mmap semantics: tensors are read lazily per key,
@@ -83,6 +84,14 @@ def load_model(
             for key in f.keys():
                 target = _map_key(key, config)
                 if target is None or target not in own:
+                    # A checkpoint tensor this architecture has no slot for.
+                    # Collected and reported below rather than skipped in
+                    # silence: dropping real weights (Qwen2's q/k/v biases, for
+                    # one) leaves a model that runs and emits fluent nonsense,
+                    # which is the failure mode spec section 19.1 calls this
+                    # project class's worst. Found on a real T4 run.
+                    if not _is_benign_extra(key):
+                        ignored.append(key)
                     continue
                 tensor = f.get_tensor(key)
                 param = own[target]
@@ -107,11 +116,36 @@ def load_model(
             f"{len(missing)} parameters were not found in the checkpoint: "
             f"{sorted(missing)[:8]}"
         )
+    if ignored:
+        raise ValueError(
+            f"{len(ignored)} checkpoint tensors have no slot in this "
+            f"architecture and would be silently dropped: {sorted(ignored)[:8]}. "
+            "Loading anyway would produce a model that runs and generates "
+            "fluent nonsense. If these are genuinely unused, add them to "
+            "_is_benign_extra with a reason."
+        )
 
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
     return model
+
+
+# Checkpoint keys that legitimately have no parameter slot here.
+_BENIGN_EXTRA_SUFFIXES = (
+    ".rotary_emb.inv_freq",      # RoPE table; recomputed in build_rope_cache
+    ".attn.bias",                # GPT-2-style causal mask buffer, not a weight
+    ".attn.masked_bias",
+)
+
+
+def _is_benign_extra(key: str) -> bool:
+    """True for checkpoint tensors that are buffers rather than weights.
+
+    Kept as an explicit allowlist so that anything genuinely unexpected fails
+    the load instead of being quietly discarded.
+    """
+    return any(key.endswith(sfx) for sfx in _BENIGN_EXTRA_SUFFIXES)
 
 
 def _map_key(key: str, config: ModelConfig) -> Optional[str]:

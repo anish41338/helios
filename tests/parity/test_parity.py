@@ -575,3 +575,72 @@ def test_engine_rejects_prompt_over_context_limit(toy_dir):
     engine = make_engine(toy_dir, max_model_len=64)
     with pytest.raises(ValueError):
         engine.add_request("toolong", list(range(100)), SamplingParams(max_tokens=1))
+
+
+def test_loader_rejects_unmapped_checkpoint_tensors(tmp_path):
+    """A checkpoint tensor with no slot in the model must fail the load.
+
+    Regression, found on a real T4: Qwen2 puts biases on q/k/v projections and
+    the loader skipped them silently, leaving a model that ran and generated
+    fluent nonsense. Missing *model* params were already caught; ignored
+    *checkpoint* params were not.
+    """
+    import shutil as _shutil
+
+    from safetensors.torch import load_file, save_file
+    from helios.exec.loader import load_model
+
+    src = tmp_path / "src"
+    save_toy_model(src, TOY_CONFIG, seed=0)
+
+    # Build the tampered copy in a separate directory: safetensors mmaps the
+    # file it reads, so rewriting it in place fails on Windows.
+    dst = tmp_path / "tampered"
+    dst.mkdir()
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        if (src / name).exists():
+            _shutil.copy(src / name, dst / name)
+    state = load_file(str(src / "model.safetensors"))
+    state["model.layers.0.self_attn.q_proj.bias"] = torch.zeros(
+        TOY_CONFIG.hidden_size
+    )
+    save_file(state, str(dst / "model.safetensors"))
+
+    with pytest.raises(ValueError, match="no slot in this architecture"):
+        load_model(dst)
+
+
+def test_qwen2_config_infers_attention_bias():
+    """Qwen2 needs q/k/v biases; Llama must not get them.
+
+    Qwen2's config.json carries no `attention_bias` flag, so defaulting to False
+    silently dropped real weights (see the regression above). Detection is by
+    model_type/architecture, with an explicit flag winning when present.
+    """
+    qwen = {
+        "vocab_size": 8, "hidden_size": 896, "intermediate_size": 16,
+        "num_hidden_layers": 1, "num_attention_heads": 14,
+        "num_key_value_heads": 2, "model_type": "qwen2",
+    }
+    llama = dict(qwen, model_type="llama", hidden_size=64,
+                 num_attention_heads=4)
+
+    assert ModelConfig.from_hf(qwen).attention_bias is True
+    assert ModelConfig.from_hf(llama).attention_bias is False
+    # An explicit flag overrides the heuristic.
+    assert ModelConfig.from_hf(dict(qwen, attention_bias=False)).attention_bias is False
+
+
+def test_attention_bias_is_actually_applied():
+    """The flag must reach the projection layers, not just the config."""
+    from helios.exec.model import HeliosModel
+
+    cfg = ModelConfig(
+        vocab_size=8, hidden_size=64, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, attention_bias=True,
+    )
+    attn = HeliosModel(cfg).layers[0].self_attn
+    assert attn.q_proj.bias is not None
+    assert attn.k_proj.bias is not None
+    assert attn.v_proj.bias is not None
+    assert attn.o_proj.bias is None, "o_proj never carries a bias"

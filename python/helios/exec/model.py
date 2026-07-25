@@ -42,6 +42,11 @@ class ModelConfig:
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
     torch_dtype: str = "float32"
+    # Qwen2 puts a bias on q/k/v projections; Llama does not. Getting this wrong
+    # does not fail loudly -- the biases are simply absent from the computation
+    # and the model emits fluent nonsense, so it is read from the checkpoint's
+    # architecture rather than assumed.
+    attention_bias: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -68,7 +73,23 @@ class ModelConfig:
             rope_theta=cfg.get("rope_theta", 10000.0),
             tie_word_embeddings=cfg.get("tie_word_embeddings", False),
             torch_dtype=cfg.get("torch_dtype", "float32"),
+            attention_bias=cls._infer_attention_bias(cfg),
         )
+
+    @staticmethod
+    def _infer_attention_bias(cfg: dict) -> bool:
+        """Whether q/k/v projections carry a bias.
+
+        HF configs are inconsistent here: Llama exposes `attention_bias`, Qwen2
+        does not expose a flag at all but always uses biases. Defaulting to
+        False for an unflagged Qwen2 checkpoint silently drops real weights, so
+        the model type is consulted as well.
+        """
+        if "attention_bias" in cfg:
+            return bool(cfg["attention_bias"])
+        model_type = str(cfg.get("model_type", "")).lower()
+        archs = " ".join(cfg.get("architectures", [])).lower()
+        return model_type.startswith("qwen2") or "qwen2" in archs
 
 
 class RMSNorm(torch.nn.Module):
@@ -144,14 +165,16 @@ class Attention(torch.nn.Module):
         self.head_dim = config.head_dim
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
+        # q/k/v may carry biases (Qwen2 does, Llama does not). o_proj never does.
+        bias = config.attention_bias
         self.q_proj = torch.nn.Linear(
-            config.hidden_size, self.n_heads * self.head_dim, bias=False
+            config.hidden_size, self.n_heads * self.head_dim, bias=bias
         )
         self.k_proj = torch.nn.Linear(
-            config.hidden_size, self.n_kv_heads * self.head_dim, bias=False
+            config.hidden_size, self.n_kv_heads * self.head_dim, bias=bias
         )
         self.v_proj = torch.nn.Linear(
-            config.hidden_size, self.n_kv_heads * self.head_dim, bias=False
+            config.hidden_size, self.n_kv_heads * self.head_dim, bias=bias
         )
         self.o_proj = torch.nn.Linear(
             self.n_heads * self.head_dim, config.hidden_size, bias=False

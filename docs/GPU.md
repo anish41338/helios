@@ -9,9 +9,9 @@ for exactly this reason — moving it is the last step, not the first.
 
 | Item | Status | Unlocked by a T4? |
 |---|---|---|
-| Triton paged-attention kernel | written, unverified | **Yes** (sm_75 is supported) |
+| Triton paged-attention kernel | **VERIFIED on T4: 5.26x**, 9/9 tests | done |
 | W4A16 / AWQ quantization | not written | **Yes** |
-| Real model, meaningful absolute tok/s | ready | **Yes** |
+| Real model, meaningful absolute tok/s | blocked by a loader bug, now fixed -- re-run | **Yes** |
 | vLLM baseline | not written | **Yes** |
 | QASSD α measurement (the §14 kill gate) | not written | **Yes** — a few hours |
 | W4A4 draft path | not written | **No** — T4 has no fast int4 path, so the draft would not be cheaper than the verify and the premise fails |

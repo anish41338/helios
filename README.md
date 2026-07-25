@@ -76,7 +76,7 @@ Full writeup with root causes and reproductions: [docs/DST.md](docs/DST.md).
 
 ## Correctness
 
-173 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
+176 tests (+9 GPU-only). The parity tests are the backbone, per spec §13.1 and §19.2 (a
 tolerance is never loosened to make a test pass):
 
 | Property | Guarantee |
@@ -88,6 +88,8 @@ tolerance is never loosened to make a test pass):
 | Engine vs naive generation loop | identical tokens |
 | Batched vs sequential decode | identical logits, and order-invariant |
 | Output under forced preemption | identical after 14 recompute cycles |
+| Triton kernel vs PyTorch paged path | matches within fp16 tolerance on a T4, order-invariant |
+| Loader vs unmapped checkpoint tensors | refuses to load rather than drop weights |
 | Allocator I1–I7 | asserted after every op, 40 randomized walks |
 
 ```bash
@@ -116,7 +118,8 @@ so read the *ratios*, not the absolute rates):
 
 | mechanism | ablation | win | regime |
 |---|---|---|---|
-| **Batched decode** | one forward pass per sequence | **2.24×** throughput | mixed |
+| **Triton fused kernel** | PyTorch paged path | **5.26×** on paged decode attn | Tesla T4, 32 seqs × 512 ctx |
+| **Batched decode** | one forward pass per sequence | **2.24×** throughput | mixed, CPU |
 | **Prefix cache** | cache off | **1.49×** throughput, 1.54× TTFT | long shared prefix |
 | **Batched prefill** | one pass per chunk | **1.16×** TTFT | long prompts, short output |
 | **Continuous batching** | static batching (8) | **1.13×** throughput | mixed |
