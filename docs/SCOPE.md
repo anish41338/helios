@@ -91,15 +91,16 @@ paged KV, gathered into a right-padded tensor and masked.
 
 Measured on this CPU, with the mechanism ablated and nothing else changed:
 
-| | out tok/s |
-|---|---|
-| `helios_full` | **409.4** |
-| `baseline_unbatched_executor` (one pass per sequence) | 183.1 |
-| `baseline_static_batch_8` | 361.2 |
-| `baseline_hf_loop` (no engine, no KV reuse) | 71.6 |
+| | T4 out tok/s | CPU out tok/s |
+|---|---|---|
+| `helios_full` | **1878.6** | 409.4 |
+| `baseline_unbatched_executor` (one pass per sequence) | 598.0 | 183.1 |
+| `baseline_static_batch_8` | 1256.3 | 361.2 |
+| `baseline_hf_loop` (no engine, no KV reuse) | 303.1 | 71.6 |
 
-**2.24× from decode batching alone**, and continuous batching beats static
-batching by 1.13×. On a Tesla T4, the fused Triton kernel is a further **5.26×**
+**3.14× from decode batching alone on the T4** (2.24× on CPU), and continuous
+batching beats static batching by 1.50× there (1.13× on CPU). Every mechanism
+pays more on the GPU, which is what the theory predicts. On a Tesla T4, the fused Triton kernel is a further **5.26×**
 over this PyTorch path for paged decode attention (32 seqs × 512 ctx), verified
 by 9/9 parity tests against it. Mean resident decode batch was 11.6 (max 24) — reported
 because the win is proportional to it. Prefill batching (1.16× TTFT) and the

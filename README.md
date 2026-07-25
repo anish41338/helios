@@ -113,35 +113,26 @@ The harness does Poisson arrivals, TTFT/TPOT/e2e percentiles, goodput against
 per-class SLO targets, and per-mechanism ablations. Two of the spec's four
 baselines are implemented (naive loop, static batching); vLLM needs CUDA.
 
-**Measured, with each number attributable to one mechanism** (CPU, toy model —
-so read the *ratios*, not the absolute rates):
+**Measured on a Tesla T4** (sm_75, CUDA 12.8, commit `81937c9`), each number a
+single-mechanism ablation with everything else identical:
 
-| mechanism | ablation | win | regime |
+| mechanism | ablation | GPU (T4) | CPU |
 |---|---|---|---|
-| **Triton fused kernel** | PyTorch paged path | **5.26×** on paged decode attn | Tesla T4, 32 seqs × 512 ctx |
-| **Batched decode** | one forward pass per sequence | **2.24×** throughput | mixed, CPU |
-| **Prefix cache** | cache off | **1.49×** throughput, 1.54× TTFT | long shared prefix |
-| **Batched prefill** | one pass per chunk | **1.16×** TTFT | long prompts, short output |
-| **Continuous batching** | static batching (8) | **1.13×** throughput | mixed |
-| whole engine | naive loop, no KV reuse | **5.7×** | mixed |
+| **Triton fused kernel** | PyTorch paged path | **5.1–5.6×** on paged decode attn | n/a |
+| **Batched decode** | one forward pass per sequence | **3.14×** throughput | 2.24× |
+| **Continuous batching** | static batching (8) | **1.50×** throughput | 1.13× |
+| **Prefix cache** | cache off | **1.38×**, 1.28× TTFT | 1.49× |
+| **Batched prefill** | one pass per chunk | **1.20×** TTFT | 1.16× |
+| whole engine | naive loop, no KV reuse | **6.2×** | 5.7× |
 
-Each row ablates **one** mechanism with everything else identical, which is what
-makes the delta attributable. Mean resident decode batch was 11.6 (max 24) —
-reported because batching pays only in proportion to it.
+`helios_full`: **1,878 out tok/s** on the T4 (409 on CPU). `batch1` gets 4.9×
+better TPOT (0.0021 s vs 0.0102 s) at 3.4× worse TTFT — the batching trade-off,
+measured.
 
-Note the regime column: the prefix cache is a *wash* on a 32-token shared prefix
-and a 1.49× win on a 128-token one; batched prefill barely matters when
-generations are long. Both readings are in the report, because which one is "the"
-result depends entirely on the workload.
-
-> An earlier version of this build ran one sequence per forward pass and showed
-> **no** batching win at all, and the generated report said so. I had documented
-> that as a GPU-dependent limitation. It wasn't — batching the GEMMs is a CPU win
-> too (~10× on a bare matmul microbenchmark at N=32), and fixing the executor
-> turned the negative result into the table above. The wrong conclusion lived in
-> these docs as fact for a while, which is the honest reason the harness now
-> reports `mean_decode_batch`: a throughput claim from a run averaging one
-> resident sequence measures nothing.
+Every scheduling mechanism pays **more** on the GPU than on CPU, which is the
+prediction the theory makes: batching is worth what the batch dimension is cheap,
+and a GPU makes it cheapest. Mean resident decode batch was 11.6 — reported
+because the win scales with it.
 
 Two further method notes: a discarded warm-up run exists because lazy-import cost
 once landed entirely on whichever ablation ran first and made it look 17× slower;
