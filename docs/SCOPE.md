@@ -93,14 +93,16 @@ Measured on this CPU, with the mechanism ablated and nothing else changed:
 
 | | out tok/s |
 |---|---|
-| `helios_full` | **406.7** |
-| `baseline_unbatched_executor` (one pass per sequence) | 177.3 |
-| `baseline_static_batch_8` | 349.5 |
-| `baseline_hf_loop` (no engine, no KV reuse) | 60.2 |
+| `helios_full` | **409.4** |
+| `baseline_unbatched_executor` (one pass per sequence) | 183.1 |
+| `baseline_static_batch_8` | 361.2 |
+| `baseline_hf_loop` (no engine, no KV reuse) | 71.6 |
 
-**2.29× from decode batching alone**, and continuous batching beats static
-batching by 1.16×. Mean resident decode batch was 11.6 (max 24) — reported
-because the win is proportional to it.
+**2.24× from decode batching alone**, and continuous batching beats static
+batching by 1.13×. Mean resident decode batch was 11.6 (max 24) — reported
+because the win is proportional to it. Prefill batching (1.16× TTFT) and the
+prefix cache (1.49× throughput) are measured on their own regimes; see
+`BENCHMARKS.md`.
 
 An earlier version of this build ran one sequence per forward pass and therefore
 showed *no* batching win; `docs/BENCHMARKS.md` said so at the time. That was a
@@ -131,8 +133,8 @@ Adapting the wording spec section 12.2 pre-approved:
 
 > Implemented a from-scratch LLM serving engine with paged attention, a
 > copy-on-write paged KV allocator, iteration-level continuous batching with a
-> batched decode executor (**2.3x** over one-forward-pass-per-sequence, **6.8x**
-> over a naive generation loop, and **1.16x** over static batching, each
+> batched decode executor (**2.2x** over one-forward-pass-per-sequence, **5.7x**
+> over a naive generation loop, and **1.13x** over static batching, each
 > measured as a single-mechanism ablation), chunked prefill, a radix-trie prefix
 > cache, and an OpenAI-compatible API.
 > Validated the scheduler and allocator with a deterministic simulation testing

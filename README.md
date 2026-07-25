@@ -111,17 +111,22 @@ baselines are implemented (naive loop, static batching); vLLM needs CUDA.
 **Measured, with each number attributable to one mechanism** (CPU, toy model —
 so read the *ratios*, not the absolute rates):
 
-| configuration | out tok/s | vs `full` |
-|---|---|---|
-| `helios_full` | **406.7** | — |
-| `baseline_static_batch_8` | 349.5 | 1.16× slower |
-| `baseline_unbatched_executor` | 177.3 | **2.29× slower** |
-| `baseline_hf_loop` (no engine, no KV reuse) | 60.2 | 6.8× slower |
+| mechanism | ablation | win | regime |
+|---|---|---|---|
+| **Batched decode** | one forward pass per sequence | **2.24×** throughput | mixed |
+| **Prefix cache** | cache off | **1.49×** throughput, 1.54× TTFT | long shared prefix |
+| **Batched prefill** | one pass per chunk | **1.16×** TTFT | long prompts, short output |
+| **Continuous batching** | static batching (8) | **1.13×** throughput | mixed |
+| whole engine | naive loop, no KV reuse | **5.7×** | mixed |
 
-`baseline_unbatched_executor` is the same engine with *only* decode batching
-ablated, which is what makes the 2.29× attributable to that mechanism rather
-than to the scheduler around it. Mean resident decode batch was 11.6 (max 24) —
-reported because the win scales with it.
+Each row ablates **one** mechanism with everything else identical, which is what
+makes the delta attributable. Mean resident decode batch was 11.6 (max 24) —
+reported because batching pays only in proportion to it.
+
+Note the regime column: the prefix cache is a *wash* on a 32-token shared prefix
+and a 1.49× win on a 128-token one; batched prefill barely matters when
+generations are long. Both readings are in the report, because which one is "the"
+result depends entirely on the workload.
 
 > An earlier version of this build ran one sequence per forward pass and showed
 > **no** batching win at all, and the generated report said so. I had documented

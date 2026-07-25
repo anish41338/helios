@@ -173,6 +173,50 @@ def _interpretation(ablations: List[Dict], baselines: List[Dict]) -> str:
             "waits for a later batch to start."
         )
 
+    pc_on = by_name.get("helios_shared_prefix_cache_on")
+    pc_off = by_name.get("helios_shared_prefix_cache_off")
+    if pc_on and pc_off and pc_off["output_throughput"] > 0:
+        on_pf = pc_on.get("scheduler_stats", {}).get("helios_tokens_prefill_total", 0)
+        off_pf = pc_off.get("scheduler_stats", {}).get("helios_tokens_prefill_total", 0)
+        on_ttft = pc_on.get("ttft", {}).get("p50")
+        off_ttft = pc_off.get("ttft", {}).get("p50")
+        detail = ""
+        if on_ttft and off_ttft:
+            detail = f" and TTFT p50 {off_ttft / on_ttft:.2f}x better"
+        lines.append(
+            f"- **Prefix cache**, measured on a long shared prefix (the regime it "
+            f"exists for): "
+            f"**{pc_on['output_throughput'] / pc_off['output_throughput']:.2f}x** "
+            f"throughput{detail}, having skipped "
+            f"{off_pf - on_pf} prefill tokens "
+            f"({100 * (off_pf - on_pf) / max(1, off_pf):.0f}% of the prompt work). "
+            "In the mixed ablation table above, with only a 32-token shared "
+            "prefix, the cache is a wash or slightly negative -- its bookkeeping "
+            "costs more than a short prefix saves. Both readings are real; which "
+            "one is 'the' result depends entirely on the workload, so both are "
+            "reported."
+        )
+
+    heavy = by_name.get("helios_prefill_heavy")
+    heavy_un = by_name.get("baseline_prefill_heavy_unbatched")
+    if heavy and heavy_un:
+        h_ttft = heavy.get("ttft", {}).get("p50")
+        u_ttft = heavy_un.get("ttft", {}).get("p50")
+        if h_ttft and u_ttft:
+            lines.append(
+                f"- **Prefill batching**, measured on its own regime (long "
+                f"prompts, short generations -- where prefill is ~55x the token "
+                f"work of decode): TTFT p50 "
+                f"{h_ttft:.3f}s vs {u_ttft:.3f}s unbatched, "
+                f"**{u_ttft / h_ttft:.2f}x** better, and "
+                f"{heavy['total_throughput'] / max(1e-9, heavy_un['total_throughput']):.2f}x "
+                "total token throughput. Smaller than the decode win because a "
+                "prefill chunk is already a large GEMM on its own -- batching "
+                "adds arithmetic density where decode batching creates it from "
+                "nothing. Reported separately because one workload cannot "
+                "exercise both mechanisms."
+            )
+
     if full.get("mean_decode_batch"):
         lines.append(
             f"- Operating point: `full` averaged "

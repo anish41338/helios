@@ -387,6 +387,35 @@ def run_baseline_sequential_executor(
     return result
 
 
+def run_baseline_unbatched_prefill(
+    model_dir: str, spec: WorkloadSpec, name: str = "baseline_unbatched_prefill"
+) -> RunResult:
+    """Ablation: prefill chunks run one forward pass each.
+
+    Separated from the decode ablation because the two mechanisms pay off on
+    different workloads -- decode batching dominates when generations are long,
+    prefill batching when prompts are long and generations short. Reporting one
+    number for "batching" would hide that.
+    """
+    engine = LLMEngine(
+        EngineConfig(
+            model_dir=model_dir,
+            kv_cache_bytes=64 * 1024 * 1024,
+            block_size=16,
+            max_num_seqs=64,
+            max_num_batched_tokens=2048,
+            max_model_len=1024,
+        )
+    )
+    runner = engine.runner
+    runner._run_prefill_batch = lambda items: [
+        o for o in (runner._run_prefill(it) for it in items) if o is not None
+    ]
+    result = _drive(engine, spec, name)
+    result.config["note"] = "prefill batching ablated: one forward pass per chunk"
+    return result
+
+
 def run_baseline_static_batch(
     model_dir: str, spec: WorkloadSpec, batch_size: int = 8
 ) -> RunResult:
@@ -487,7 +516,7 @@ def main() -> None:
     ap.add_argument(
         "--suite",
         default="ablations",
-        choices=["ablations", "baselines", "all", "quick"],
+        choices=["ablations", "baselines", "all", "quick", "prefill-heavy", "prefix-cache"],
     )
     ap.add_argument("--static-batch-size", type=int, default=8)
     args = ap.parse_args()
@@ -524,9 +553,57 @@ def main() -> None:
                 run_helios(args.model, spec, ABLATIONS[name], name=f"helios_{name}")
             )
 
+    if args.suite == "prefill-heavy":
+        # Long prompts, short generations: the regime where prefill batching --
+        # not decode batching -- is the mechanism under test. One workload cannot
+        # exercise both, so the suite is explicit about which it measures.
+        heavy = WorkloadSpec(
+            num_requests=args.requests,
+            prompt_len_mean=max(96, args.prompt_len),
+            prompt_len_sigma=0.3,
+            output_len_mean=4,
+            output_len_sigma=0.2,
+            max_prompt_len=max(192, args.max_prompt_len),
+            seed=args.seed,
+        )
+        print("[bench] prefill-heavy: full ...", flush=True)
+        results.append(run_helios(args.model, heavy, {}, name="helios_prefill_heavy"))
+        print("[bench] prefill-heavy: unbatched prefill ...", flush=True)
+        results.append(
+            run_baseline_unbatched_prefill(
+                args.model, heavy, name="baseline_prefill_heavy_unbatched"
+            )
+        )
+
+    if args.suite == "prefix-cache":
+        # A long shared prefix is the regime the cache exists for. With a short
+        # one its bookkeeping can cost more than it saves, which is a real result
+        # but a misleading headline -- so the mechanism gets its own workload.
+        shared = WorkloadSpec(
+            num_requests=args.requests,
+            prompt_len_mean=max(160, args.prompt_len),
+            prompt_len_sigma=0.15,
+            output_len_mean=8,
+            output_len_sigma=0.2,
+            max_prompt_len=max(256, args.max_prompt_len),
+            shared_prefix_len=max(128, args.shared_prefix),
+            seed=args.seed,
+        )
+        print("[bench] prefix-cache: on ...", flush=True)
+        results.append(run_helios(args.model, shared, {}, name="helios_shared_prefix_cache_on"))
+        print("[bench] prefix-cache: off ...", flush=True)
+        results.append(
+            run_helios(
+                args.model, shared, {"enable_prefix_cache": False},
+                name="helios_shared_prefix_cache_off",
+            )
+        )
+
     if args.suite in ("baselines", "all"):
-        print("[bench] running unbatched-executor ablation ...", flush=True)
+        print("[bench] running unbatched-decode ablation ...", flush=True)
         results.append(run_baseline_sequential_executor(args.model, spec))
+        print("[bench] running unbatched-prefill ablation ...", flush=True)
+        results.append(run_baseline_unbatched_prefill(args.model, spec))
         print("[bench] running static batching baseline ...", flush=True)
         results.append(run_baseline_static_batch(args.model, spec, args.static_batch_size))
         print("[bench] running naive loop baseline ...", flush=True)
