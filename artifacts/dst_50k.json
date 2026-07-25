@@ -2,9 +2,7 @@
   "seeds": 50000,
   "passed": 50000,
   "failures": [],
-  "elapsed_s": 3806.6,
+  "elapsed_s": 3462.7,
   "platform": "Windows-11-10.0.26200-SP0",
-  "commit_at_launch": "9ff86f6",
-  "note": "Launched at 9ff86f6. Commits since (12f88aa, 491f6f1, f80bc73) add a scheduler method the DST harness never calls, an unused dataclass field, import removals, and docs -- no change to any code path this sweep exercises.",
-  "command": "python -m helios.cli vopr --seeds 50000 --progress-every 10000"
+  "commit": "61b46a5bab0310b2abe0ff9cc5dd26e58e52a2de"
 }

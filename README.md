@@ -74,7 +74,7 @@ Full writeup with root causes and reproductions: [docs/DST.md](docs/DST.md).
 
 ## Correctness
 
-166 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
+172 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
 tolerance is never loosened to make a test pass):
 
 | Property | Guarantee |
@@ -84,6 +84,7 @@ tolerance is never loosened to make a test pass):
 | Speculative vs non-speculative decode | **bit-identical**, γ ∈ {1,2,4,8} (spec §7.2) |
 | Prefix cache on vs off | identical output |
 | Engine vs naive generation loop | identical tokens |
+| Batched vs sequential decode | identical logits, and order-invariant |
 | Allocator I1–I7 | asserted after every op, 40 randomized walks |
 
 ```bash
@@ -107,23 +108,34 @@ The harness does Poisson arrivals, TTFT/TPOT/e2e percentiles, goodput against
 per-class SLO targets, and per-mechanism ablations. Two of the spec's four
 baselines are implemented (naive loop, static batching); vLLM needs CUDA.
 
-**The headline result is negative, and the report says so.** Continuous batching
-shows no throughput win here, because this executor runs one sequence per forward
-pass — a decode step costs ~5–7 ms *per resident sequence*, flat. Continuous
-batching's premise is that the batch dimension is nearly free (one fused kernel,
-N sequences), and with a serialized executor that premise fails. Static batching
-matches or beats it even on a workload with a 50× spread in output lengths and
-Poisson arrivals, so this is a property of the build, not a workload artifact.
-What the scheduler does deliver here is admission control, preemption, prefix
-reuse, and liveness under fault injection — verified by tests and DST rather than
-by a stopwatch. Details in [docs/SCOPE.md](docs/SCOPE.md).
+**Measured, with each number attributable to one mechanism** (CPU, toy model —
+so read the *ratios*, not the absolute rates):
 
-> Two method notes, since both are the kind of artifact that becomes a false
-> claim. (1) The first harness reported one ablation as 17× slower than an
-> identical one; the cause was lazy-import cost landing on whichever config ran
-> first, so there is now a discarded warm-up run. (2) The static-batching result
-> above was tested against its own explanation — the heterogeneous-length rerun
-> was an attempt to *confirm* continuous batching and instead refuted it.
+| configuration | out tok/s | vs `full` |
+|---|---|---|
+| `helios_full` | **406.7** | — |
+| `baseline_static_batch_8` | 349.5 | 1.16× slower |
+| `baseline_unbatched_executor` | 177.3 | **2.29× slower** |
+| `baseline_hf_loop` (no engine, no KV reuse) | 60.2 | 6.8× slower |
+
+`baseline_unbatched_executor` is the same engine with *only* decode batching
+ablated, which is what makes the 2.29× attributable to that mechanism rather
+than to the scheduler around it. Mean resident decode batch was 11.6 (max 24) —
+reported because the win scales with it.
+
+> An earlier version of this build ran one sequence per forward pass and showed
+> **no** batching win at all, and the generated report said so. I had documented
+> that as a GPU-dependent limitation. It wasn't — batching the GEMMs is a CPU win
+> too (~10× on a bare matmul microbenchmark at N=32), and fixing the executor
+> turned the negative result into the table above. The wrong conclusion lived in
+> these docs as fact for a while, which is the honest reason the harness now
+> reports `mean_decode_batch`: a throughput claim from a run averaging one
+> resident sequence measures nothing.
+
+Two further method notes: a discarded warm-up run exists because lazy-import cost
+once landed entirely on whichever ablation ran first and made it look 17× slower;
+and speculation is *slower* here by design (draft and verify share fp32 weights —
+see [docs/SCOPE.md](docs/SCOPE.md)).
 
 ## Layout
 

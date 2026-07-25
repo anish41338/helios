@@ -30,12 +30,13 @@ could never be compiled, run, or benchmarked here.
 | Paged KV cache, block tables, ref counts | 5 | Built. I1–I7 asserted, property-tested |
 | Copy-on-write prefix sharing | 5.3 | Built, incl. the shared-partial-tail case |
 | Host swap tier (second memory tier) | 6.3 | Built, exercised by DST |
-| Iteration-level continuous batching | 6.1 | Built |
+| Iteration-level continuous batching | 6.1 | Built; batched decode executor, 2.3x ablation win |
 | SLO classes + token-bucket admission | 6.2 | Built, step-driven (deterministic) |
 | Recompute/swap preemption | 6.3 | Built, with the ratio test |
 | Chunked prefill | 6.1 | Built, bit-identical to single-shot |
 | RadixTrie prefix cache | 3 | Built, block-aligned, LRU eviction |
 | Paged attention | 8.3 | Built as gather+SDPA (the spec's fallback path) |
+| Batched paged decode attention | 8.3 | Built (vectorised over sequences, padded + masked) |
 | Llama/Qwen2 architecture (GQA, RoPE, SwiGLU, RMSNorm) | 8.1 | Built from scratch |
 | safetensors loading | 8.2 | Built (fp32/fp16) |
 | Sampling (greedy, temp, top-k, top-p, per-request seeds) | 9.1 | Built |
@@ -81,33 +82,38 @@ What it does establish: the scheduler's accept/rollback bookkeeping and KV
 truncation are correct, which is the part most likely to silently corrupt
 output. The quantization asymmetry that would make it fast is future work.
 
-## The serialized-executor limitation (read this before quoting throughput)
+## Batched decode (what the throughput claim rests on)
 
-The executor runs **one sequence per forward pass**, in a Python loop
-(`exec/runner.py`). The scheduler emits properly batched `ExecStep`s — batching
-the executor later needs no scheduler change — but today the batch dimension is
-not exploited by a fused kernel.
+The executor runs **all resident decoding sequences in one forward pass**.
+Sequences are concatenated along a single token dimension, so every projection
+and the MLP become one large GEMM; attention stays per-sequence over its own
+paged KV, gathered into a right-padded tensor and masked.
 
-Measured consequence: a decode step costs ~5–7 ms **per resident sequence**,
-flat, regardless of batch size. On a GPU, one fused kernel would serve N
-sequences for roughly the cost of one.
+Measured on this CPU, with the mechanism ablated and nothing else changed:
 
-This matters because it removes continuous batching's entire premise. If keeping
-a slot full costs full price, there is nothing to gain from filling it
-immediately. So:
+| | out tok/s |
+|---|---|
+| `helios_full` | **406.7** |
+| `baseline_unbatched_executor` (one pass per sequence) | 177.3 |
+| `baseline_static_batch_8` | 349.5 |
+| `baseline_hf_loop` (no engine, no KV reuse) | 60.2 |
 
-- **continuous batching shows no throughput win in this build**, and the
-  generated `BENCHMARKS.md` says so;
-- static batching matches or beats it, even on a workload with a 50× spread in
-  output lengths and Poisson arrivals (checked explicitly — it is not a workload
-  artifact);
-- what the scheduler demonstrably provides here is admission control,
-  preemption under memory pressure, prefix reuse, and liveness under fault
-  injection — properties verified by tests and DST, not by a stopwatch.
+**2.29× from decode batching alone**, and continuous batching beats static
+batching by 1.16×. Mean resident decode batch was 11.6 (max 24) — reported
+because the win is proportional to it.
 
-Do not claim a batching speedup from this repository. The correct claim is that
-the mechanism is implemented and verified correct; the performance case for it
-requires a batched kernel and a GPU.
+An earlier version of this build ran one sequence per forward pass and therefore
+showed *no* batching win; `docs/BENCHMARKS.md` said so at the time. That was a
+property of the implementation, not of the hardware: the fix needed no GPU, only
+batched GEMMs. Worth stating because the wrong conclusion — "you need a GPU to
+show this" — was documented here as fact for a while.
+
+Still true: this is CPU, on a toy model, so absolute tokens/second mean nothing.
+The **ratios between ablations** are the result, and the parity tests
+(`test_batched_decode_matches_sequential`, `test_batched_decode_is_order_invariant`,
+`test_engine_output_unchanged_by_decode_batching`) are what make them
+trustworthy — a batching bug would otherwise mix sequences' KV and produce
+plausible, wrong output.
 
 ## What the benchmarks do and do not show
 
@@ -124,8 +130,11 @@ model is a toy.
 Adapting the wording spec section 12.2 pre-approved:
 
 > Implemented a from-scratch LLM serving engine with paged attention, a
-> copy-on-write paged KV allocator, iteration-level continuous batching,
-> chunked prefill, a radix-trie prefix cache, and an OpenAI-compatible API.
+> copy-on-write paged KV allocator, iteration-level continuous batching with a
+> batched decode executor (**2.3x** over one-forward-pass-per-sequence, **6.8x**
+> over a naive generation loop, and **1.16x** over static batching, each
+> measured as a single-mechanism ablation), chunked prefill, a radix-trie prefix
+> cache, and an OpenAI-compatible API.
 > Validated the scheduler and allocator with a deterministic simulation testing
 > harness (TigerBeetle/FoundationDB style) under adversarial fault injection:
 > 50,000 seeds, seven invariants checked every step, every failure replayable

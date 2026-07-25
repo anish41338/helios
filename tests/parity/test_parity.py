@@ -345,6 +345,138 @@ def test_max_tokens_and_eos_stop_conditions(toy_dir):
     assert out.finish_reason.value == "length"
 
 
+@pytest.mark.parametrize("n_seqs", [1, 2, 3, 8])
+def test_batched_decode_matches_sequential(toy_model, n_seqs):
+    """Batched decode must be numerically identical to one-pass-per-sequence.
+
+    This is the safety net for the executor's main optimisation. A batching bug
+    -- an off-by-one in a token slice, a mis-scattered attention output, a
+    padding mask that leaks across rows -- would silently mix sequences' KV and
+    produce fluent, wrong output. That is the failure mode spec section 19.1
+    calls this project class's characteristic risk, so it is asserted directly
+    rather than assumed from throughput looking better.
+
+    Sequences deliberately have DIFFERENT context lengths, so the right-padding
+    and masking in the batched path are actually exercised.
+    """
+    from helios.exec.model import BatchedAttnMeta
+
+    cfg = toy_model.config
+    prompts = [[5 + i, 9, 14, 22, 33][: 2 + (i % 4)] for i in range(n_seqs)]
+    tables = [[2 * i, 2 * i + 1] for i in range(n_seqs)]
+    assert len({len(p) for p in prompts}) > 1 or n_seqs == 1
+
+    def caches():
+        return [
+            PagedKVCache(64, 16, cfg.num_key_value_heads, cfg.head_dim)
+            for _ in range(cfg.num_hidden_layers)
+        ]
+
+    # Sequential: prefill each, then one decode step each, separate passes.
+    cs = caches()
+    seq_logits = []
+    with torch.inference_mode():
+        firsts = []
+        for p, tb in zip(prompts, tables):
+            lg = toy_model.forward(p, list(range(len(p))), cs, tb, False, len(p))
+            firsts.append(int(lg[-1].argmax()))
+        for i, (p, tb) in enumerate(zip(prompts, tables)):
+            lg = toy_model.forward([firsts[i]], [len(p)], cs, tb, True, len(p) + 1)
+            seq_logits.append(lg[-1].clone())
+
+    # Batched: identical prefills, then ONE batched decode pass.
+    cb = caches()
+    with torch.inference_mode():
+        for p, tb in zip(prompts, tables):
+            toy_model.forward(p, list(range(len(p))), cb, tb, False, len(p))
+        positions = [len(p) for p in prompts]
+        meta = BatchedAttnMeta(
+            token_slices=[(i, i + 1) for i in range(n_seqs)],
+            block_tables=tables,
+            context_lens=[len(p) + 1 for p in prompts],
+            start_positions=positions,
+            is_decode=True,
+        )
+        batched = toy_model.forward_batched(firsts, positions, cb, meta)
+
+    assert batched.shape[0] == n_seqs
+    for i in range(n_seqs):
+        assert int(batched[i].argmax()) == int(seq_logits[i].argmax()), (
+            f"sequence {i} sampled a different token when batched"
+        )
+        torch.testing.assert_close(batched[i], seq_logits[i], atol=1e-5, rtol=1e-5)
+
+
+def test_batched_decode_is_order_invariant(toy_model):
+    """A sequence's logits must not depend on its position within the batch.
+
+    If they do, some state is leaking across rows -- the single most dangerous
+    class of bug in a batched executor, because output stays plausible.
+    """
+    from helios.exec.model import BatchedAttnMeta
+
+    cfg = toy_model.config
+    prompts = [[5, 9, 14], [22, 33, 41, 7], [88, 100]]
+    tables = [[0, 1], [2, 3], [4, 5]]
+
+    def run(order):
+        caches = [
+            PagedKVCache(64, 16, cfg.num_key_value_heads, cfg.head_dim)
+            for _ in range(cfg.num_hidden_layers)
+        ]
+        with torch.inference_mode():
+            firsts = {}
+            for i in order:
+                lg = toy_model.forward(
+                    prompts[i], list(range(len(prompts[i]))), caches,
+                    tables[i], False, len(prompts[i]),
+                )
+                firsts[i] = int(lg[-1].argmax())
+            meta = BatchedAttnMeta(
+                token_slices=[(k, k + 1) for k in range(len(order))],
+                block_tables=[tables[i] for i in order],
+                context_lens=[len(prompts[i]) + 1 for i in order],
+                start_positions=[len(prompts[i]) for i in order],
+                is_decode=True,
+            )
+            out = toy_model.forward_batched(
+                [firsts[i] for i in order],
+                [len(prompts[i]) for i in order],
+                caches,
+                meta,
+            )
+        return {i: out[k].clone() for k, i in enumerate(order)}
+
+    forward = run([0, 1, 2])
+    reversed_ = run([2, 1, 0])
+    for i in range(3):
+        torch.testing.assert_close(forward[i], reversed_[i], atol=1e-5, rtol=1e-5)
+
+
+def test_engine_output_unchanged_by_decode_batching(toy_dir):
+    """End-to-end: ablating decode batching must not change any token.
+
+    Exercises the same switch the benchmark's `baseline_unbatched_executor`
+    flips, so the measured speedup is known to be free of output changes.
+    """
+    params = SamplingParams(max_tokens=10, temperature=0.0)
+    prompts = [[5, 9, 14], [22, 33], [41, 7, 2, 88]]
+
+    batched = make_engine(toy_dir)
+    for i, p in enumerate(prompts):
+        batched.add_request(f"b{i}", p, params)
+    got = {o.request_id: o.token_ids for o in batched.run_until_complete()}
+
+    plain = make_engine(toy_dir)
+    runner = plain.runner
+    runner._run_decode_batch = lambda items: [runner._run_decode(it, 0) for it in items]
+    for i, p in enumerate(prompts):
+        plain.add_request(f"b{i}", p, params)
+    want = {o.request_id: o.token_ids for o in plain.run_until_complete()}
+
+    assert got == want
+
+
 def test_stop_string_truncates_output(toy_dir):
     """A `stop` string must terminate generation and be absent from the output.
 

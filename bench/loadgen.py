@@ -111,6 +111,10 @@ class RunResult:
     output_throughput: float = 0.0
     total_throughput: float = 0.0
     goodput_ratio: float = 0.0
+    # Mean/max resident decoding sequences per step -- the operating point that
+    # determines whether batched decode had anything to batch.
+    mean_decode_batch: float = 0.0
+    max_decode_batch: int = 0
     scheduler_stats: Dict = field(default_factory=dict)
     env: Dict = field(default_factory=dict)
 
@@ -184,7 +188,19 @@ def run_helios(
     )
     cfg_kwargs.update(overrides)
     engine = LLMEngine(EngineConfig(**cfg_kwargs))
+    result = _drive(engine, spec, name)
+    result.config = {k: str(v) for k, v in cfg_kwargs.items()}
+    return result
 
+
+def _drive(engine: LLMEngine, spec: WorkloadSpec, name: str) -> RunResult:
+    """Submit a workload honouring its arrival times and measure the result.
+
+    Shared by every engine-backed configuration so that an ablation differs only
+    in the engine it is handed -- if each variant had its own driver loop, a
+    difference in the loop would be indistinguishable from a difference in the
+    mechanism.
+    """
     requests = spec.generate()
     # Clamp to what this engine can actually serve, so the harness measures
     # scheduling rather than rejection.
@@ -195,6 +211,7 @@ def run_helios(
     start = time.perf_counter()
     pending = list(servable)
     submitted = 0
+    decode_batch_sizes: List[int] = []
 
     while pending or engine.scheduler.has_work:
         now = time.perf_counter() - start
@@ -212,6 +229,9 @@ def run_helios(
                 pass
 
         if engine.scheduler.has_work:
+            decode_batch_sizes.append(
+                sum(1 for s in engine.scheduler.running if s.is_prefill_done)
+            )
             engine.step()
         elif pending:
             # Idle until the next arrival rather than spinning.
@@ -223,7 +243,7 @@ def run_helios(
     result = RunResult(
         name=name,
         workload=_workload_dict(spec),
-        config={k: str(v) for k, v in cfg_kwargs.items()},
+        config={},
         num_requests=submitted,
         completed=len(metrics),
         duration_s=duration,
@@ -237,6 +257,13 @@ def run_helios(
         },
         env=_env_info(),
     )
+    # Mean resident decode batch: the mechanism's actual operating point, and
+    # the number that explains whether batching had anything to work with.
+    nonzero = [n for n in decode_batch_sizes if n > 0]
+    result.mean_decode_batch = (
+        statistics.fmean(nonzero) if nonzero else 0.0
+    )
+    result.max_decode_batch = max(decode_batch_sizes) if decode_batch_sizes else 0
     if duration > 0:
         result.output_throughput = result.output_tokens / duration
         result.total_throughput = (result.prompt_tokens + result.output_tokens) / duration
@@ -324,6 +351,39 @@ def run_baseline_hf_loop(model_dir: str, spec: WorkloadSpec) -> RunResult:
     if duration > 0:
         result.output_throughput = total_out / duration
         result.total_throughput = (total_prompt + total_out) / duration
+    return result
+
+
+def run_baseline_sequential_executor(
+    model_dir: str, spec: WorkloadSpec, name: str = "baseline_unbatched_executor"
+) -> RunResult:
+    """Baseline 3: HELIOS with the decode batching ablated away.
+
+    Identical scheduler, identical paging, identical everything -- except each
+    decoding sequence gets its own forward pass instead of sharing one batched
+    GEMM. This isolates the executor's batching from every other mechanism,
+    which is the only way to attribute a speedup to it (spec section 11:
+    "each row attributable to one mechanism").
+    """
+    engine = LLMEngine(
+        EngineConfig(
+            model_dir=model_dir,
+            kv_cache_bytes=64 * 1024 * 1024,
+            block_size=16,
+            max_num_seqs=64,
+            max_num_batched_tokens=2048,
+            max_model_len=1024,
+        )
+    )
+    # Force the one-sequence-per-pass path that this build used before batched
+    # decode existed.
+    runner = engine.runner
+    runner._run_decode_batch = lambda items: [
+        runner._run_decode(it, 0) for it in items
+    ]
+
+    result = _drive(engine, spec, name)
+    result.config["note"] = "decode batching ablated: one forward pass per sequence"
     return result
 
 
@@ -465,6 +525,8 @@ def main() -> None:
             )
 
     if args.suite in ("baselines", "all"):
+        print("[bench] running unbatched-executor ablation ...", flush=True)
+        results.append(run_baseline_sequential_executor(args.model, spec))
         print("[bench] running static batching baseline ...", flush=True)
         results.append(run_baseline_static_batch(args.model, spec, args.static_batch_size))
         print("[bench] running naive loop baseline ...", flush=True)

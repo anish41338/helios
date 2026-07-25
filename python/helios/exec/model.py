@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from .paged_attn import (
     PagedKVCache,
     paged_attention_decode,
+    paged_attention_decode_batched,
     paged_attention_prefill,
 )
 
@@ -193,6 +194,106 @@ class Attention(torch.nn.Module):
         out = out.reshape(n_tokens, self.n_heads * self.head_dim)
         return self.o_proj(out)
 
+    def forward_batched(
+        self,
+        hidden: torch.Tensor,          # [n_tokens_total, hidden_size]
+        positions: torch.Tensor,       # [n_tokens_total]
+        kv_cache: PagedKVCache,
+        meta: "BatchedAttnMeta",
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attention over a flattened multi-sequence batch.
+
+        The projections are single GEMMs over every token in the batch; only the
+        attention itself is per-sequence. That split is what makes batching pay.
+        """
+        n_tokens = hidden.shape[0]
+
+        q = self.q_proj(hidden).view(n_tokens, self.n_heads, self.head_dim)
+        k = self.k_proj(hidden).view(n_tokens, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(hidden).view(n_tokens, self.n_kv_heads, self.head_dim)
+
+        q = apply_rope(q, cos, sin, positions)
+        k = apply_rope(k, cos, sin, positions)
+
+        # Write each sequence's slice of KV into its own blocks before attending.
+        for i, (lo, hi) in enumerate(meta.token_slices):
+            kv_cache.write(
+                meta.block_tables[i], meta.start_positions[i], k[lo:hi], v[lo:hi]
+            )
+
+        out = BatchedAttention.run(q, kv_cache, meta, self.scale)
+        out = out.reshape(n_tokens, self.n_heads * self.head_dim)
+        return self.o_proj(out)
+
+
+@dataclass
+class BatchedAttnMeta:
+    """Per-sequence metadata for one batched forward pass.
+
+    Sequences are concatenated along a single token dimension so that every
+    projection and MLP is one large GEMM. Attention still has to be done per
+    sequence (each attends only over its own KV), but that is a small fraction
+    of the work -- the projections and MLP dominate, and batching them is worth
+    ~10x on CPU at 32 sequences.
+
+    `token_slices` maps each sequence to its span in the flattened token
+    dimension, which is how the per-sequence attention outputs are scattered
+    back into place.
+    """
+
+    token_slices: List[Tuple[int, int]]     # (start, end) per sequence
+    block_tables: List[List[int]]
+    context_lens: List[int]
+    start_positions: List[int]
+    is_decode: bool                         # all-decode batches take the fast path
+
+    @property
+    def n_seqs(self) -> int:
+        return len(self.token_slices)
+
+
+class BatchedAttention:
+    """Applies attention for a flattened multi-sequence batch.
+
+    Not a Module -- it is a helper that the Attention module delegates to, so
+    the weights stay in one place.
+    """
+
+    @staticmethod
+    def run(
+        q: torch.Tensor,                    # [n_tokens, n_q_heads, head_dim]
+        kv_cache: PagedKVCache,
+        meta: BatchedAttnMeta,
+        scale: float,
+    ) -> torch.Tensor:
+        if meta.is_decode:
+            # One query token per sequence: the fully batched path.
+            return paged_attention_decode_batched(
+                q, kv_cache, meta.block_tables, meta.context_lens, scale
+            )
+
+        # Mixed or prefill batch: attention per sequence over its own span.
+        # Chunk lengths differ, so this cannot be one matmul without padding to
+        # the longest chunk, which for prefill would waste more than it saves.
+        out = torch.empty_like(q)
+        for i, (lo, hi) in enumerate(meta.token_slices):
+            if hi - lo == 1 and meta.context_lens[i] > 1:
+                out[lo:hi] = paged_attention_decode(
+                    q[lo], kv_cache, meta.block_tables[i], meta.context_lens[i], scale
+                ).unsqueeze(0)
+            else:
+                out[lo:hi] = paged_attention_prefill(
+                    q[lo:hi],
+                    kv_cache,
+                    meta.block_tables[i],
+                    meta.start_positions[i],
+                    meta.context_lens[i],
+                    scale,
+                )
+        return out
+
 
 class MLP(torch.nn.Module):
     """SwiGLU feed-forward: down(silu(gate(x)) * up(x))."""
@@ -244,6 +345,27 @@ class DecoderLayer(torch.nn.Module):
         residual = hidden
         hidden = self.post_attention_layernorm(hidden)
         hidden = self.mlp(hidden)
+        return residual + hidden
+
+    def forward_batched(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache: PagedKVCache,
+        meta: "BatchedAttnMeta",
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden
+        hidden = self.input_layernorm(hidden)
+        hidden = self.self_attn.forward_batched(
+            hidden, positions, kv_cache, meta, cos, sin
+        )
+        hidden = residual + hidden
+
+        residual = hidden
+        hidden = self.post_attention_layernorm(hidden)
+        hidden = self.mlp(hidden)   # one GEMM pair over the whole batch
         return residual + hidden
 
 
@@ -308,6 +430,39 @@ class HeliosModel(torch.nn.Module):
             )
         hidden = self.norm(hidden)
         return self.lm_head(hidden[-1:])   # [1, vocab_size]
+
+    def forward_batched(
+        self,
+        token_ids: List[int],          # flattened across all sequences
+        positions: List[int],
+        kv_caches: List[PagedKVCache],
+        meta: BatchedAttnMeta,
+        logits_at: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """One forward pass over many sequences at once.
+
+        `token_ids` and `positions` are the concatenation of every sequence's
+        tokens; `meta.token_slices` says which span belongs to which sequence.
+
+        Returns [len(logits_at), vocab_size] -- by default the last token of each
+        sequence, which is what sampling needs. Computing the LM head only at
+        those rows matters: vocab is often 128k, so projecting every prefill
+        token would dominate the step.
+        """
+        tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device)
+        pos = torch.tensor(positions, dtype=torch.long, device=self.device)
+
+        hidden = self.embed_tokens(tokens)
+        for layer, kv_cache in zip(self.layers, kv_caches):
+            hidden = layer.forward_batched(
+                hidden, pos, kv_cache, meta, self.rope_cos, self.rope_sin
+            )
+        hidden = self.norm(hidden)
+
+        if logits_at is None:
+            logits_at = [hi - 1 for (_lo, hi) in meta.token_slices]
+        rows = torch.tensor(logits_at, dtype=torch.long, device=self.device)
+        return self.lm_head(hidden.index_select(0, rows))
 
     def forward_all_logits(
         self,

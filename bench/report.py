@@ -86,13 +86,28 @@ def _interpretation(ablations: List[Dict], baselines: List[Dict]) -> str:
         return r["output_throughput"] if r else None
 
     base = full["output_throughput"]
-    lines.append(
-        "Throughput differences between the ablations are within a few percent "
-        "of each other, i.e. within run-to-run noise on an unpinned CPU. **On "
-        "this workload, no scheduling mechanism shows a throughput win.** That "
-        "is the honest reading; the mechanisms differ in *latency shape*, not in "
-        "tokens/second.\n"
-    )
+
+    unbatched = by_name.get("baseline_unbatched_executor")
+    if unbatched and unbatched["output_throughput"] > 0:
+        speedup = base / unbatched["output_throughput"]
+        lines.append(
+            f"**Batched decode is the dominant win: {speedup:.2f}x** "
+            f"({base:.1f} vs {unbatched['output_throughput']:.1f} out tok/s). "
+            "`baseline_unbatched_executor` is the *same* engine -- same scheduler, "
+            "same paging, same prefix cache -- with only the executor's decode "
+            "batching ablated, so the delta is attributable to that one "
+            "mechanism. Every resident sequence's projections and MLP collapse "
+            "into single GEMMs; attention stays per-sequence over its own paged "
+            "KV.\n"
+        )
+
+    naive = by_name.get("baseline_hf_loop")
+    if naive and naive["output_throughput"] > 0:
+        lines.append(
+            f"- vs `baseline_hf_loop` (no engine at all, no KV reuse): "
+            f"{base / naive['output_throughput']:.1f}x, though on a smaller "
+            "workload -- see the caveat below."
+        )
 
     b1 = thr("helios_batch1")
     if b1 is not None:
@@ -130,35 +145,42 @@ def _interpretation(ablations: List[Dict], baselines: List[Dict]) -> str:
         )
 
     static = by_name.get("baseline_static_batch_8")
-    if static and static["output_throughput"] >= base:
+    if static and static["output_throughput"] > 0:
+        ratio = base / static["output_throughput"]
+        if ratio >= 1.0:
+            lines.append(
+                f"- vs `baseline_static_batch_8`: **{ratio:.2f}x** "
+                f"({base:.1f} vs {static['output_throughput']:.1f} out tok/s). "
+                "Continuous batching wins by reusing a finished sequence's slot "
+                "in the same iteration instead of idling until the batch's "
+                "longest member completes. The margin is modest because these "
+                "output lengths are only moderately skewed -- the wider the "
+                "spread, the more head-of-line waste static batching suffers."
+            )
+        else:
+            lines.append(
+                f"- **Negative result:** `baseline_static_batch_8` "
+                f"({static['output_throughput']:.1f} out tok/s) beats `full` "
+                f"({base:.1f}), i.e. {ratio:.2f}x. Continuous batching only pays "
+                "when the batch is actually kept full -- check "
+                "`mean_decode_batch` below. If it is well under `max_num_seqs`, "
+                "arrivals were too sparse for the mechanism to have anything to "
+                "work with, and throughput is the wrong metric for that regime."
+            )
         lines.append(
-            f"- **Negative result, stated plainly:** `baseline_static_batch_8` "
-            f"({static['output_throughput']:.1f} out tok/s) matches or beats "
-            f"`full` ({base:.1f}), and continuous batching shows **no** "
-            "throughput advantage here.\n"
-            "\n"
-            "  The cause is measured, not guessed: this executor runs one "
-            "sequence per forward pass in a Python loop, so a decode step costs "
-            "~5-7 ms **per resident sequence** regardless of batch size. "
-            "Continuous batching's whole premise is that the batch dimension is "
-            "nearly free -- one fused kernel serves N sequences for roughly the "
-            "cost of one, so keeping slots full is pure profit. With a serialised "
-            "executor that premise does not hold, and holding more sequences "
-            "resident only adds scheduling work.\n"
-            "\n"
-            "  This was checked against the mechanism's actual precondition "
-            "rather than assumed: re-running with a 50x spread in output lengths "
-            "(3 to 166 tokens) and Poisson arrivals -- the regime where "
-            "reusing a finished slot should matter most -- still favoured static "
-            "batching (0.91x). So the result is not a workload artifact; it is a "
-            "property of this build. Demonstrating the advantage requires a "
-            "batched attention kernel, which needs a GPU (see `docs/SCOPE.md`).\n"
-            "\n"
-            "  What the scheduler *does* deliver here is admission control, "
-            "preemption under memory pressure, and bounded latency per SLO "
-            "class -- correctness and liveness properties, which is what "
-            "`docs/DST.md` covers. Static batching's low TTFT is separately an "
-            "artifact of enqueueing every request at t=0."
+            "  Static batching's low TTFT is an artifact of enqueueing every "
+            "request at t=0: with all work available immediately, no request "
+            "waits for a later batch to start."
+        )
+
+    if full.get("mean_decode_batch"):
+        lines.append(
+            f"- Operating point: `full` averaged "
+            f"{full['mean_decode_batch']:.1f} resident decoding sequences per "
+            f"step (max {full.get('max_decode_batch', 0)}). Batching pays only in "
+            "proportion to this number, so it is reported rather than left "
+            "implicit -- a throughput claim from a run averaging ~1 resident "
+            "sequence would be measuring nothing."
         )
 
     naive = by_name.get("baseline_hf_loop")
