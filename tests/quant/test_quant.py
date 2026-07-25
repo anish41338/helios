@@ -216,6 +216,84 @@ def test_quant_linear_stores_fewer_bytes(cfg):
     assert ql.stored_bytes() < fp / 3.5
 
 
+def test_quantization_still_saves_memory_after_running(cfg):
+    """The claim has to survive USE, not just construction.
+
+    This is the regression test for a real bug: `dequantized()` memoised the fp
+    weight, so after one forward pass the layer held the packed int4 weights AND a
+    full fp copy -- 1.26x MORE memory than the fp16 Linear it replaced, while
+    `stored_bytes()` cheerfully reported a 3.8x saving. Every quantization memory
+    figure in the repo was false in practice.
+
+    Asserts the invariant (resident memory stays below fp after real use) rather
+    than the symptom (`_deq_cache is None`), because the invariant is what the
+    documentation claims and it stays meaningful if the implementation changes.
+    """
+    lin = torch.nn.Linear(512, 512, bias=False).to(torch.float16)
+    fp_bytes = lin.weight.numel() * lin.weight.element_size()
+    ql = QuantLinear.from_linear(lin, cfg)
+
+    x = torch.randn(4, 512, dtype=torch.float16)
+    for _ in range(3):
+        ql(x)
+
+    assert ql.resident_bytes() < fp_bytes / 3.0, (
+        f"after 3 forward passes the layer holds {ql.resident_bytes()} bytes "
+        f"against {fp_bytes} for plain fp16 -- the memory saving was given back"
+    )
+    assert ql.resident_bytes() == ql.stored_bytes(), "something is being cached"
+
+
+def test_opt_in_cache_is_reported_as_resident(cfg):
+    """Caching is allowed, but it must show up in resident_bytes().
+
+    The bug was not the cache; it was a cache that `stored_bytes()` did not
+    account for. With caching on, resident must exceed stored -- otherwise the
+    accounting is lying again, just in the other direction.
+    """
+    lin = torch.nn.Linear(512, 512, bias=False).to(torch.float16)
+    ql = QuantLinear.from_linear(lin, cfg, cache_dequantized=True)
+    assert ql.resident_bytes() == ql.stored_bytes()
+    ql(torch.randn(2, 512, dtype=torch.float16))
+    assert ql.resident_bytes() > ql.stored_bytes()
+
+
+def test_caching_does_not_change_the_result(cfg):
+    """Cached and uncached paths must be numerically identical."""
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(256, 128, bias=True)
+    x = torch.randn(8, 256)
+    a = QuantLinear.from_linear(lin, cfg, cache_dequantized=False)
+    b = QuantLinear.from_linear(lin, cfg, cache_dequantized=True)
+    b(x)                                    # populate the cache
+    assert torch.equal(a(x), b(x))
+
+
+def test_quantized_model_report_counts_resident_not_packed(toy_model_factory):
+    """A model-level compression figure must also survive use."""
+    model = toy_model_factory()
+    report = quantize_model(model, QuantConfig(group_size=64))
+    before = report.total_quant_bytes
+
+    from helios.exec.paged_attn import PagedKVCache
+
+    ids = list(range(3, 35))
+    caches = [
+        PagedKVCache(4, 16, model.config.num_key_value_heads, model.config.head_dim)
+        for _ in range(model.config.num_hidden_layers)
+    ]
+    with torch.inference_mode():
+        model.forward(ids, list(range(len(ids))), caches, [0, 1, 2, 3], False, len(ids))
+
+    after = sum(p.numel() * p.element_size() for p in model.parameters()) + sum(
+        m.resident_bytes() for m in model.modules() if isinstance(m, QuantLinear)
+    )
+    assert after == before, (
+        f"resident bytes grew from {before} to {after} by running the model, so "
+        "the reported compression was only true before the first forward pass"
+    )
+
+
 def test_device_move_invalidates_the_dequantized_cache(cfg):
     """A cached fp weight must not survive a .to() call.
 
@@ -224,7 +302,9 @@ def test_device_move_invalidates_the_dequantized_cache(cfg):
     because that is what is observable without a second device.
     """
     lin = torch.nn.Linear(128, 32, bias=False)
-    ql = QuantLinear.from_linear(lin, cfg)
+    # Caching is off by default, so it has to be requested for there to be a
+    # cache to invalidate at all.
+    ql = QuantLinear.from_linear(lin, cfg, cache_dequantized=True)
     ql(torch.randn(2, 128))                 # populate the cache
     assert ql._deq_cache is not None
     ql.to(torch.float64)

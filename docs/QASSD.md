@@ -76,23 +76,43 @@ Keeping the symmetric mode is what makes the bookkeeping testable: with identica
 precisions, output must be bit-identical, so there is no quantization noise to
 hide a bug behind.
 
-## What it costs
+## What it costs — the complete accounting
 
-`+51% weight memory`, measured, not estimated:
+Enabling QASSD is an **increase** in memory on two axes, not one. The weight-only
+figure is the one that is easy to quote and it is incomplete:
 
+| | |
+|---|---|
+| Draft weights (int4 copy of the same weights) | **+41%** on weights |
+| Draft KV shadow (a second, quantized KV cache) | **+28%** of the main cache |
+
+Both are real allocations the engine makes at construction. `engine.memory_report()`
+returns them together, deliberately, so they cannot be quoted separately by
+accident:
+
+```python
+{'target_weight_bytes': ..., 'main_kv_bytes': ...,
+ 'draft_weight_bytes': ..., 'draft_kv_bytes': ...,
+ 'total_overhead_ratio': 1.28,      # <- the number to quote
+ 'weight_overhead_ratio': 1.41}     # <- weights only; incomplete on its own
 ```
-target 2403.9 MiB fp32  +  draft 1223.9 MiB int4  =  1.51x the target alone
-```
 
-Stated because the opposite is easy to imply. "4-bit quantization" sounds like a
-reduction; QASSD is an *addition*, because both precisions must be resident. A
-deployment that only wants W4A16 serving keeps the int4 copy alone and gets
-**1.96× smaller** — but that is a different configuration, and it has no
-speculation.
+The second KV cache is not optional. The draft's keys and values are computed
+from int4 weights, so they are numerically *not* the target's and cannot share
+storage — sharing would corrupt the target's context with approximate keys, and
+would look like a working optimisation right up until output quality was measured.
+That cache is spec §7.4's "quantized KV shadow", and it is quantized for exactly
+the reason the spec wanted it to be: a second full-precision cache would halve the
+concurrency the engine just paid for.
 
-(1.51× rather than 1.25× because the master here is fp32, not fp16, and because
-`lm_head` stays full precision. On a GPU in fp16 the ratio would be closer to
-1.3×.)
+**An earlier version of this document reported only the weight figure.** That
+understated the cost, and the omission is the kind that survives review because
+the number quoted was true — just not the whole cost. Now pinned by
+`test_memory_report_includes_the_draft_kv_shadow`.
+
+A deployment that only wants W4A16 serving keeps the int4 copy *alone* and gets a
+real reduction — but that configuration has no speculation in it, and conflating
+the two is the easiest misrepresentation available here.
 
 ## Why measuring α on a CPU is legitimate
 
@@ -183,7 +203,7 @@ The gate passes, so the feature is not killed. But the honest summary is
 - α = 0.655 against a target of 0.78 — the target is missed by a wide margin
 - best γ is 2, giving ~1.4× modelled (or ~1.56× using measured tokens/pass)
 - γ=8 is a net loss
-- and it costs +51% weight memory
+- and it costs more memory, not less: +41% on weights **plus** a second KV cache
 
 For a 0.5B model this is a poor trade. The reason to expect better on a larger
 model is that quantization error at fixed bit-width falls with model size — bigger
@@ -197,7 +217,7 @@ the cost is known, the gate has a real number behind it, and the spec's γ=4 cho
 is measurably wrong for this model. **A negative-leaning result that was actually
 measured is worth more than an unmeasured positive one.**
 
-## Adaptive gating (implemented)
+## Adaptive gating — and the measurement that proved it earns its keep
 
 `_effective_gamma` disables speculation when:
 
@@ -205,10 +225,58 @@ measured is worth more than an unmeasured positive one.**
   draft compute stops being free
 - **measured acceptance < 0.5** over a sliding window of 64 outcomes
 
-The measured α of 0.655 sits uncomfortably close to that 0.5 floor, which means
-the gate will fire on hard prompts. That is the intended behaviour.
+Both fire in practice, and the second one is doing real work. Measured on the toy
+model, where an int4 draft agrees only 12.5% of the time:
 
-The DST harness exercises both extremes by forcing acceptance to 0% and 100%.
+```
+47 decode steps, 1 with gamma>0  ->  the gate disabled speculation after ONE step
+```
+
+That matters because ungated speculation on a bad draft is catastrophic, not
+merely unhelpful. Measured on this CPU at batch 8, 16 requests:
+
+| configuration | out tok/s | vs no speculation |
+|---|---|---|
+| speculation off | **200.4** | — |
+| symmetric, γ=2 | 62.9 | **3.19× slower** |
+| symmetric, γ=4 | 65.7 | **3.05× slower** |
+| QASSD γ=2 (gate active) | 141.7 | 1.41× slower |
+
+Two things to read off that table.
+
+**Speculation as implemented forfeits batched decode.** The draft loop is
+inherently serial and runs per sequence, so with 8 resident sequences a
+speculative step costs 8×(γ+1) unbatched forward passes where a normal step costs
+one batched pass. On a CPU that trade is never worth it — the batching win is
+larger than anything speculation can return. This is a property of *this*
+implementation and of CPU economics, not of speculative decoding.
+
+**The gate converts a 3.2× disaster into a 1.4× tax.** QASSD is faster than
+symmetric speculation here not because the int4 draft is better — it is far worse,
+α = 0.125 — but because the gate *noticed* and stopped. That is the mechanism that
+makes it safe to ship a draft whose quality you have not characterised on every
+workload: correctness comes from the verifier, and throughput protection comes
+from the gate.
+
+The measured α of 0.655 on the real model sits uncomfortably close to the 0.5
+floor, which means the gate will fire on hard prompts. That is intended.
+
+Pinned by `test_gate_disables_speculation_when_the_draft_is_bad`. The DST harness
+additionally exercises both extremes by forcing acceptance to 0% and 100%.
+
+### A benchmark that was measuring nothing
+
+Until this was checked, the `with_spec_decode` ablation ran at the default
+`max_num_seqs=64`, where the mean decode batch is 12–16. The batch-size gate
+therefore fired on **every** decode step — measured, 0 of 23 steps had γ>0 — so
+the row labelled "speculation" was measuring speculation being switched off. The
+~9% difference it reported was scheduling variance.
+
+The `spec` suite caps the batch to 8 so the mechanism is actually on the critical
+path. Same class of error as the prefix cache on a short shared prefix and the
+INT8 KV cache in a non-binding pool: **a mechanism benchmarked outside its regime
+reads as noise or as a regression.** Third occurrence in this project, which is
+why the fix is a dedicated suite rather than a note.
 
 ## Still not built
 

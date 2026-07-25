@@ -52,7 +52,8 @@ class EngineConfig:
     # bounded accuracy cost measured in tests/quant/test_kv_quant.py.
     quantize_kv: bool = False
     # QASSD (spec section 7): draft speculation from a 4-bit view of the same
-    # weights instead of from the target itself. Costs +25% weight memory, and is
+    # weights instead of from the target itself. INCREASES memory (both precisions
+    # resident, plus a second KV cache -- see memory_report()), and is
     # only meaningful with enable_spec_decode.
     quantized_draft: bool = False
     quant_group_size: int = 128
@@ -217,9 +218,11 @@ class LLMEngine:
             return None
         if not config.enable_spec_decode:
             raise ValueError(
-                "quantized_draft=True requires enable_spec_decode=True: the int4 "
-                "draft copy costs +25% weight memory and is only read by the "
-                "speculative path"
+                "quantized_draft=True requires enable_spec_decode=True. The int4 "
+                "draft is only read by the speculative path, so without it the copy "
+                "is pure overhead -- and it is an increase, not a saving: both "
+                "precisions stay resident, plus a second KV cache for the draft. "
+                "Call engine.memory_report() for the exact figures."
             )
 
         from .exec.qassd import DualPrecisionModel
@@ -470,6 +473,54 @@ class LLMEngine:
 
     def metrics(self) -> List[RequestMetrics]:
         return list(self._metrics.values())
+
+    def memory_report(self) -> Dict[str, float]:
+        """Complete resident-memory accounting for this engine.
+
+        Exists because `DualPrecisionModel.memory_overhead()` covers only
+        *weights*, and quoting it as "the cost of QASSD" understates the real
+        figure: enabling a quantized draft also allocates an entire second KV
+        cache (the section 7.4 shadow), because the draft's keys and values come
+        from int4 weights and are numerically not the target's. On this engine
+        that shadow is ~0.28x the main cache -- not nothing, and not visible
+        anywhere in the weight-only number.
+
+        Reported as one dict so the two costs cannot be quoted separately by
+        accident.
+        """
+        from .exec.quant import QuantLinear
+
+        target_w = sum(
+            p.numel() * p.element_size() for p in self.runner.model.parameters()
+        )
+        main_kv = self.runner.kv_bytes
+        draft_w = 0
+        draft_kv = 0
+        if self.dual is not None:
+            draft_w = sum(
+                p.numel() * p.element_size() for p in self.dual.draft.parameters()
+            ) + sum(
+                m.resident_bytes()
+                for m in self.dual.draft.modules()
+                if isinstance(m, QuantLinear)
+            )
+        if self.runner.draft_kv_caches:
+            draft_kv = sum(c.nbytes for c in self.runner.draft_kv_caches)
+
+        base = target_w + main_kv
+        total = base + draft_w + draft_kv
+        return {
+            "target_weight_bytes": target_w,
+            "main_kv_bytes": main_kv,
+            "draft_weight_bytes": draft_w,
+            "draft_kv_bytes": draft_kv,
+            "baseline_bytes": base,
+            "total_bytes": total,
+            # The number to quote for "what does enabling QASSD cost".
+            "total_overhead_ratio": total / max(1, base),
+            "weight_overhead_ratio": (target_w + draft_w) / max(1, target_w),
+            "kv_quantized": bool(self.config.quantize_kv),
+        }
 
     def stats_snapshot(self) -> Dict[str, object]:
         """Values backing the Prometheus surface (spec section 9.2)."""

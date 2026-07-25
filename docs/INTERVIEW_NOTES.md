@@ -168,8 +168,11 @@ this number invites them:
   spec §7.3's target was 0.78. So the feature ships and is worth less than planned.
 - *Optimal γ is 2, not 4.* And at γ=8 the modelled speedup is **0.94× — a net
   loss**, because a rejection discards every drafted token after it.
-- *It costs +51% weight memory*, not −75%. Both precisions must be resident.
-  "4-bit quantization" sounding like a saving is the easiest misreading here.
+- *It costs more memory, not less,* on two axes: **+41% weights** (both precisions
+  resident) **and an entire second KV cache** for the draft, ~28% of the main one.
+  `engine.memory_report()` returns both together so they cannot be quoted apart.
+  "4-bit quantization" sounding like a saving is the easiest misreading here, and an
+  earlier version of these notes quoted the weight figure alone.
 - *Why is measuring this on a CPU legitimate?* α is the probability that two weight
   matrices produce the same argmax on the same context. It is arithmetic, not
   throughput, so it transfers to a GPU unchanged. The *speedup* does not — there is

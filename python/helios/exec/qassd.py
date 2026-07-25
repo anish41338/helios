@@ -19,11 +19,22 @@ memory and has a different tokenizer/distribution. QASSD's answer: draft with a
 
 What it costs
 -------------
-Both precisions must be resident. This implementation keeps the fp weights as
-the master and a packed int4 copy for drafting: **+25% weight memory**, not
--75%. Stated plainly because the opposite is easy to imply. (A deployment that
-only ever wants W4A16 serving keeps the int4 copy alone and pays -75%; that is a
-different configuration, available here as `quantize_model` on its own.)
+More memory, not less, and on TWO axes:
+
+  1. both weight precisions stay resident -- the fp master plus a packed int4
+     copy for drafting;
+  2. the draft needs its OWN KV cache. Its keys and values are computed from int4
+     weights, so they are numerically not the target's and cannot share storage.
+
+`LLMEngine.memory_report()` returns both together, deliberately: quoting the
+weight figure alone understates the real cost, and an earlier version of this
+docstring did exactly that. `DualPrecisionModel.memory_overhead()` covers only
+weights and says so.
+
+Stated plainly because the opposite is easy to imply -- "4-bit quantization"
+sounds like a saving. A deployment that only ever wants W4A16 serving keeps the
+int4 copy alone and does get a real reduction, but that configuration contains no
+speculation; it is `quantize_model` on its own.
 
 The gate
 --------
@@ -148,7 +159,9 @@ class DualPrecisionModel:
     the point -- the runner asks for `target` or `draft` by name.
 
     The draft is a deep copy that then has its Linears replaced in place. That
-    copy is the +25% memory, and it is made once at load.
+    copy is the extra weight memory, and it is made once at load. The draft's
+    KV shadow is allocated separately by ModelRunner; see LLMEngine.memory_report()
+    for the combined figure.
     """
 
     def __init__(
@@ -176,12 +189,18 @@ class DualPrecisionModel:
         return self.target.device
 
     def memory_overhead(self) -> Dict[str, float]:
-        """What holding both precisions costs, in bytes and as a ratio."""
+        """What holding both precisions costs, in bytes and as a ratio.
+
+        Uses `resident_bytes()`, not `stored_bytes()`: the difference is any
+        dequantization cache a QuantLinear is holding, and reporting the packed
+        size while the process holds an fp copy is how a memory regression gets
+        published as a saving. See QuantLinear.dequantized().
+        """
         target_bytes = sum(p.numel() * p.element_size() for p in self.target.parameters())
         draft_bytes = sum(
             p.numel() * p.element_size() for p in self.draft.parameters()
         ) + sum(
-            m.stored_bytes() for m in self.draft.modules() if isinstance(m, QuantLinear)
+            m.resident_bytes() for m in self.draft.modules() if isinstance(m, QuantLinear)
         )
         return {
             "target_bytes": target_bytes,

@@ -203,6 +203,88 @@ def test_quantized_draft_without_speculation_is_a_config_error(quant_toy_dir):
         )
 
 
+def test_memory_report_includes_the_draft_kv_shadow(quant_toy_dir):
+    """The complete cost, not just the weights.
+
+    Regression test for an incomplete accounting: `memory_overhead()` covers only
+    weights, and enabling a quantized draft also allocates an entire second KV
+    cache. Quoting the weight-only figure as "the cost of QASSD" understated it.
+    """
+    from helios.engine import EngineConfig, LLMEngine
+
+    base = dict(model_dir=quant_toy_dir, kv_cache_bytes=16 * 1024 * 1024,
+                max_num_seqs=8, max_model_len=256)
+    plain = LLMEngine(EngineConfig(**base))
+    qassd = LLMEngine(EngineConfig(
+        **base, enable_spec_decode=True, spec_gamma=2,
+        quantized_draft=True, quant_group_size=64,
+    ))
+
+    p, q = plain.memory_report(), qassd.memory_report()
+    assert p["draft_weight_bytes"] == 0 and p["draft_kv_bytes"] == 0
+    assert p["total_overhead_ratio"] == pytest.approx(1.0)
+
+    # Both extra costs must be present and counted.
+    assert q["draft_weight_bytes"] > 0, "the int4 draft weights are not counted"
+    assert q["draft_kv_bytes"] > 0, "the draft KV shadow is not counted"
+    assert q["total_bytes"] == (
+        q["target_weight_bytes"] + q["main_kv_bytes"]
+        + q["draft_weight_bytes"] + q["draft_kv_bytes"]
+    )
+    assert q["total_overhead_ratio"] > 1.0
+
+
+def test_gate_disables_speculation_when_the_draft_is_bad(quant_toy_dir):
+    """The adaptive gate must react to a genuinely bad draft (spec section 7.3).
+
+    On a random-weight toy model an int4 draft agrees almost never, so acceptance
+    collapses and speculation becomes pure cost. The gate has to notice. Without
+    it, QASSD on a bad draft is ~3x SLOWER than not speculating at all -- measured.
+
+    This is what makes shipping a draft of uncharacterised quality safe: not that
+    the draft is good, but that the engine stops using it when it is not.
+    """
+    from helios.core.types import SamplingParams
+    from helios.engine import EngineConfig, LLMEngine
+
+    engine = LLMEngine(EngineConfig(
+        model_dir=quant_toy_dir, kv_cache_bytes=16 * 1024 * 1024,
+        max_num_seqs=8, max_model_len=256,
+        enable_spec_decode=True, spec_gamma=2,
+        quantized_draft=True, quant_group_size=64,
+    ))
+
+    gammas = []
+    original = engine.scheduler._build_exec_step
+
+    def spy(*a, **k):
+        step = original(*a, **k)
+        if step.decodes:
+            gammas.append(step.spec_gamma)
+        return step
+
+    engine.scheduler._build_exec_step = spy
+
+    for i in range(12):
+        engine.add_request(
+            f"r{i}", [3 + (i * 11 + j) % 200 for j in range(32)],
+            SamplingParams(max_tokens=20, temperature=0.0),
+        )
+    engine.run_until_complete(max_steps=6000)
+
+    assert gammas, "no decode steps ran"
+    speculated = sum(1 for g in gammas if g > 0)
+    assert speculated >= 1, "speculation never ran, so the gate proves nothing"
+    assert speculated < len(gammas), (
+        "the gate never fired despite a draft that agrees "
+        f"{engine.runner.measured_acceptance:.1%} of the time"
+    )
+    assert engine.runner.measured_acceptance < 0.6, (
+        "this test assumes a bad draft; if the toy draft became good, the "
+        "assertion above no longer tests the gate"
+    )
+
+
 def test_draft_uses_a_separate_quantized_kv_cache(quant_toy_dir):
     """The draft's KV comes from int4 weights and cannot share the target's.
 

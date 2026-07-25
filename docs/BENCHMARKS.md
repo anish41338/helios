@@ -51,9 +51,13 @@ Each row differs from `full` by one mechanism, which is what makes the delta att
 | `no_chunked_prefill` | 24/24 | 439.5 | 0.3160 | 0.3161 | 0.0313 | 0.0359 | 0.9608 | 0.88 |
 | `no_prefix_cache` | 24/24 | 443.3 | 0.3163 | 0.3164 | 0.0292 | 0.0320 | 0.9293 | 0.88 |
 | `prefill_heavy` | 32/32 | 90.2 | 0.9561 | 1.1549 | 0.1536 | 0.3427 | 1.2636 | 0.28 |
+| `qassd_g2_batch8` | 16/16 | 141.7 | 1.0647 | 1.9601 | 0.0545 | 0.0609 | 2.0117 | 0.25 |
 | `shared_prefix_cache_off` | 24/24 | 146.3 | 0.8277 | 0.8278 | 0.0864 | 0.1454 | 1.2906 | 0.17 |
 | `shared_prefix_cache_on` | 24/24 | 218.6 | 0.5360 | 0.5361 | 0.0554 | 0.0777 | 0.8695 | 0.38 |
 | `small_kv_pool` | 24/24 | 460.2 | 0.2940 | 0.2941 | 0.0300 | 0.0357 | 0.9097 | 0.88 |
+| `spec_g2_batch8` | 16/16 | 62.9 | 2.6283 | 4.3251 | 0.1314 | 0.1541 | 4.8938 | 0.25 |
+| `spec_g4_batch8` | 16/16 | 65.7 | 2.0865 | 4.2266 | 0.1317 | 0.1526 | 4.7947 | 0.25 |
+| `spec_off_batch8` | 16/16 | 200.4 | 0.5762 | 1.1834 | 0.0316 | 0.0372 | 1.2462 | 0.81 |
 | `with_spec_decode` | 24/24 | 331.1 | 0.3199 | 0.3200 | 0.0356 | 0.0403 | 0.9570 | 0.88 |
 
 ## Baselines
@@ -136,7 +140,11 @@ Each row differs from `full` by one mechanism, which is what makes the delta att
 - `artifacts/helios_no_chunked_prefill_seed0.json` -> `helios_no_chunked_prefill`
 - `artifacts/helios_no_prefix_cache_seed0.json` -> `helios_no_prefix_cache`
 - `artifacts/helios_prefill_heavy_seed7.json` -> `helios_prefill_heavy`
+- `artifacts/helios_qassd_g2_batch8_seed0.json` -> `helios_qassd_g2_batch8`
 - `artifacts/helios_shared_prefix_cache_off_seed11.json` -> `helios_shared_prefix_cache_off`
 - `artifacts/helios_shared_prefix_cache_on_seed11.json` -> `helios_shared_prefix_cache_on`
 - `artifacts/helios_small_kv_pool_seed0.json` -> `helios_small_kv_pool`
+- `artifacts/helios_spec_g2_batch8_seed0.json` -> `helios_spec_g2_batch8`
+- `artifacts/helios_spec_g4_batch8_seed0.json` -> `helios_spec_g4_batch8`
+- `artifacts/helios_spec_off_batch8_seed0.json` -> `helios_spec_off_batch8`
 - `artifacts/helios_with_spec_decode_seed0.json` -> `helios_with_spec_decode`

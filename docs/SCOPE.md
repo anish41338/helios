@@ -49,7 +49,7 @@ could never be compiled, run, or benchmarked here.
 | **AWQ activation-aware scaling** | 8.2 | Built. **1.58× lower output error than RTN**, measured over 168 layers |
 | **INT8 quantized KV cache (the "KV shadow")** | 7.4 | Built. Per-token per-head scales, **1.94× vs fp16**, 3.4× more blocks |
 | **Quantization-asymmetric speculation (QASSD)** | 7.1 | Built. **α = 0.6548 measured** on Qwen2.5-0.5B — see below |
-| **KV transfer FSM (prefill→decode migration)** | 6.4 | Built. 7 states, 5 fault kinds, **DST-verified under injection** |
+| **KV transfer FSM (prefill→decode migration)** | 6.4 | **Verified design, NOT in the serving path** — see the note below |
 | **Token-by-token SSE streaming** | 9.1 | Built. Incremental detokenization, reassembly asserted |
 | OpenAI-compatible HTTP API | 9.1 | Built (`/v1/completions`, `/v1/chat/completions`) |
 | Prometheus metrics | 9.2 | Built |
@@ -80,7 +80,9 @@ has the full result; the honest summary:
 - Best γ is **2**, not the spec's 4. At γ=8 speculation is a net **loss** (0.94×).
 - Modelled speedup at best γ: **~1.4×**, or ~1.56× using measured tokens/pass.
   **Modelled, not measured** — there is no int4 GEMM here (spec section 19.6).
-- It costs **+51% weight memory**, measured. Both precisions must be resident.
+- It costs **more** memory, not less: +41% on weights (both precisions resident)
+  **and a whole second KV cache** for the draft. `engine.memory_report()` returns
+  both, because quoting the weight figure alone understates it.
 
 The safety property is what makes this shippable and it is asserted, not argued:
 `test_asymmetric_speculation_matches_the_target_exactly` requires **identical
@@ -99,8 +101,28 @@ not a result, and it is not claimed.**
 
 ## End-to-end verification on real weights
 
-The strongest single correctness result in this repo. On a Tesla T4, fp16,
-Qwen2.5-0.5B (630M params as loaded -- 494M plus the untied `lm_head` copy):
+The strongest single correctness result in this repo, and it has now been
+reproduced on **two devices independently**, which is what rules out a
+device-specific fluke or a misreported run.
+
+On CPU (fp32), the same prompts produce the same continuations token-for-token as
+the T4 did, and the full OpenAI-compatible HTTP path was driven against the real
+checkpoint:
+
+```
+POST /v1/completions   "The capital of France is"
+  -> " Paris. It is the largest city in Europe and the second"
+
+POST /v1/completions   stream=true, same prompt
+  -> 13 SSE frames, concatenating to byte-identical text
+```
+
+So: real pretrained weights, through the paged KV path, through the scheduler,
+through the HTTP frontend, with incremental streaming, reassembling exactly. That
+is the whole stack, not a component.
+
+On a Tesla T4, fp16, Qwen2.5-0.5B (630M params as loaded -- 494M plus the untied
+`lm_head` copy):
 
 ```
 "The capital of France is"  ->  " Paris. It is the largest city in Europe and the
@@ -182,11 +204,33 @@ It is not evidence about GPU throughput, quantized inference, or any comparison
 with another engine. Absolute tokens/second numbers are meaningless here — the
 model is a toy.
 
-## Disaggregation: what "built" means here
+## Disaggregation: what "built" means here, stated harder than before
 
-Spec section 6.4 wants prefill and decode on separate devices with the prompt's KV
-cache transferred between them. There is one device, so the *transport* is
-simulated. Everything else is real and is the part where the bugs live:
+**`core/disagg.py` is imported by exactly one non-test module: the simulation
+harness.** The engine, the scheduler, and the runner never call it. Grep it:
+
+```bash
+grep -rn "disagg" --include="*.py" python/ | grep -v core/disagg.py
+```
+
+So it is **a verified specification, not a shipped feature**, and it does not
+belong in the same sentence as paged attention. An earlier version of this
+document listed it as "Built" in the same table as things that run on every
+request, which overstated it. Corrected.
+
+What it actually is: a state machine with a fault model, checked by the same
+harness that checks the scheduler, whose *design* is the deliverable. That is real
+engineering — a protocol with partial-failure semantics worked out and
+mechanically verified before any transport exists is worth more than transport
+code with the semantics left implicit — but it is not a feature a user can turn
+on, and calling it one would be the exact failure this document exists to prevent.
+
+Why it was not wired in anyway: with one device there is no transfer to perform.
+Blocks are already where they need to be. Routing them through a transfer FSM
+would be theatre — a code path that exists to make a claim true rather than to do
+work.
+
+With that framing fixed, here is what is genuinely verified:
 
 - **A 7-state FSM** (`core/disagg.py`) with an explicit legal-transition table.
   The table is the specification — an FSM that tolerates an unlisted edge
@@ -219,6 +263,29 @@ An error worth recording: the first version of that arithmetic put the KV at
 2.6 GB instead of 262 MB — a factor of ten — which inverted the PCIe verdict. It
 was caught by a test written against the real formula, not by review. An
 arithmetic slip in a comment is still a claim with no reproduction behind it.
+
+## What a deliberate audit of this repo found
+
+Run after everything above was written, tested, and committed — 263 tests green,
+5,000 DST seeds green. The point of recording it: a green suite is not evidence
+that the *claims* are true, only that the code does what the tests say. Four of
+these five were claim errors, not code errors, and no test was failing.
+
+| Found | Severity | Status |
+|---|---|---|
+| `QuantLinear` memoised the dequantized fp weight, so after one forward pass an int4 layer held **26% MORE memory than the fp16 layer it replaced** — while `stored_bytes()` reported a 3.8× saving | **Critical.** Every quantization memory claim in the repo was false in practice | Fixed; caching is now opt-in and off by default, and `resident_bytes()` exists so the two can never be conflated again |
+| The `with_spec_decode` ablation ran at a batch size above the speculation gate, so **0 of 23 decode steps actually speculated** | **High.** A row labelled "speculation" measured scheduling variance | Fixed; a `spec` suite caps the batch to 8 so the mechanism is on the critical path |
+| `memory_overhead()` reported only weights, omitting the **entire second KV cache** QASSD allocates | **Medium.** The quoted number was true and incomplete, which is harder to catch than a false one | Fixed; `engine.memory_report()` returns both costs in one dict |
+| `docs/SCOPE.md` listed the KV transfer FSM as "Built" beside paged attention, when **nothing outside the test harness imports it** | **Medium.** Overstated a verified design as a shipped feature | Fixed; relabelled, with the grep that proves it |
+| A benchmark run was contaminated by a concurrent job on the same machine, inverting the γ=2 / γ=4 ordering | Low | Re-run on an idle machine; the inversion disappeared |
+
+Each fix carries a regression test, and each of those tests was **mutation-checked**
+— the bug it exists to catch was reintroduced deliberately and the test was
+confirmed to fail. Worth noting which one caught the accept-logic mutation: the
+symmetric-speculation parity tests all *passed* it, because at α = 1.0 the draft
+token and the verified token are the same, so the bug is invisible. Only
+`test_asymmetric_speculation_matches_the_target_exactly` failed. A test suite can
+be large and green and still have no coverage of the thing that matters.
 
 ## Defensible claims
 

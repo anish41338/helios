@@ -52,7 +52,8 @@ class ModelRunner:
 
         # QASSD: when present, `dual.draft` is an int4 view of the same weights
         # and speculation drafts from it instead of from the target. Optional
-        # because the asymmetry costs +25% weight memory and is only worth paying
+        # because the asymmetry increases memory (see engine.memory_report) and is
+        # only worth paying
         # when speculation is enabled (spec section 7).
         self.dual = dual
 

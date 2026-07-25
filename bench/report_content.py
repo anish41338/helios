@@ -149,13 +149,22 @@ def build_story(d, figs: Dict[str, Path], prov: dict, helpers) -> list:
              "error bounds derived, asserted"],
             ["Speculation", "int4 draft / fp verify, adaptive γ",
              "bit-identical output"],
-            ["KV migration", "7-state transfer FSM, 5 fault kinds",
-             "simulation + injected-bug tests"],
             ["Frontend", "OpenAI-compatible, incremental SSE, Prometheus",
              "stream reassembly identity"],
         ],
         [30 * mm, 73 * mm, 60 * mm],
     ))
+    st += [
+        Spacer(1, 3 * mm),
+        P(
+            "One row is deliberately absent from that table. The 7-state KV transfer "
+            "FSM (section 5) is verified by the same harness, but <b>nothing outside "
+            "the test harness imports it</b> &mdash; it is a verified design, not a "
+            "code path a request travels. Listing it beside paged attention would "
+            "overstate it, and an earlier draft of this report did exactly that.",
+            "small",
+        ),
+    ]
     st += [
         Spacer(1, 4 * mm),
         P("Why paging, stated as the trade it is", "h2"),
@@ -531,6 +540,55 @@ def build_story(d, figs: Dict[str, Path], prov: dict, helpers) -> list:
             ),
         ]
 
+    st.append(P("What speculation actually costs, once it is actually running", "h2"))
+    off = d.bench.get("helios_spec_off_batch8")
+    sg2 = d.bench.get("helios_spec_g2_batch8")
+    sg4 = d.bench.get("helios_spec_g4_batch8")
+    qg2 = d.bench.get("helios_qassd_g2_batch8")
+    if off and sg2 and sg4 and qg2:
+        base = off.get("output_throughput", 1.0)
+        rows = [["batch capped to 8", "out tok/s", "vs no speculation"]]
+        for label, rec in (("speculation off", off), ("symmetric, γ=2", sg2),
+                           ("symmetric, γ=4", sg4), ("QASSD γ=2 (gate active)", qg2)):
+            t = rec.get("output_throughput", 0.0)
+            rel = "—" if rec is off else f"{base / max(1e-9, t):.2f}× slower"
+            rows.append([label, f"{t:.1f}", rel])
+        st.append(table(rows, [50 * mm, 30 * mm, 40 * mm], align_right=(1, 2)))
+        st += [
+            Spacer(1, 3 * mm),
+            P(
+                "<b>Speculation as implemented forfeits batched decode</b>, and on a "
+                "CPU that trade is never worth making. The draft loop is inherently "
+                "serial and runs per sequence, so with 8 resident sequences a "
+                "speculative step costs 8&times;(&gamma;+1) unbatched forward passes "
+                "where a normal step costs one batched pass. The batching win is "
+                "larger than anything speculation can return. That is a property of "
+                "this implementation and of CPU economics, not of the technique.",
+                "body",
+            ),
+            P(
+                "The second row worth reading is the last one. QASSD is <i>faster</i> "
+                "than symmetric speculation here &mdash; not because the int4 draft is "
+                "better (it is far worse: &alpha; = 0.125 on random toy weights) but "
+                "because the <b>adaptive gate noticed and stopped</b>. Measured, it "
+                "disabled speculation after a single step, turning a 3.2&times; "
+                "disaster into a 1.4&times; tax. Correctness comes from the verifier; "
+                "throughput protection comes from the gate. Together they are what "
+                "make it safe to ship a draft whose quality has not been characterised "
+                "on every workload.",
+                "body",
+            ),
+            P(
+                "This ablation did not exist until an audit found that the previous "
+                "one measured nothing: it ran at the default batch of 12&ndash;16, "
+                "above the gate's threshold of 8, so 0 of 23 decode steps actually "
+                "speculated and the row labelled \"speculation\" was reporting "
+                "scheduling variance. Third occurrence of the same methodology error "
+                "in this project, after the prefix cache and the INT8 KV pool.",
+                "small",
+            ),
+        ]
+
     st.append(P("The INT8 KV cache: mechanism verified, benefit not realisable here", "h2"))
     fp, i8 = d.bench.get("helios_kv_fp_cramped"), d.bench.get("helios_kv_int8_cramped")
     if fp and i8:
@@ -592,12 +650,22 @@ def build_story(d, figs: Dict[str, Path], prov: dict, helpers) -> list:
         ),
         P(
             "Disaggregation removes the contention instead, by putting the two on "
-            "separate devices and transferring the prompt's KV cache between them. "
-            "There is one device here, so the transport is simulated &mdash; but the "
-            "part where the bugs live is not the byte movement. It is ownership "
-            "accounting across a partial failure, and that is fully built and fully "
-            "verified.",
+            "separate devices and transferring the prompt's KV cache between them.",
             "body",
+        ),
+        P(
+            "<b>What follows is a verified design, not a shipped feature, and the "
+            "distinction is worth making precisely.</b> Nothing outside the test "
+            "harness imports this module &mdash; the engine, the scheduler and the "
+            "runner never call it. With one device there is no transfer to perform, "
+            "because the blocks are already where they need to be; routing them through "
+            "a transfer FSM would be theatre, a code path existing to make a claim true "
+            "rather than to do work. What is real is the protocol: a state machine with "
+            "partial-failure semantics worked out and mechanically checked before any "
+            "transport exists. That is worth more than transport code with the "
+            "semantics left implicit &mdash; but it is not something a user can switch "
+            "on, and an earlier draft of this report listed it as though it were.",
+            "callout",
         ),
         P("Why a state machine and not a coroutine", "h2"),
         P(
@@ -655,7 +723,71 @@ def build_story(d, figs: Dict[str, Path], prov: dict, helpers) -> list:
     ]
 
     # -------------------------------------------------------------- section 6
-    st += [PageBreak(), P("6 &nbsp; What is not built", "h1")]
+    # ------------------------------------------------ the audit (section 5b)
+    st += [PageBreak(), P("6 &nbsp; What a deliberate audit found", "h1")]
+    st += [
+        P(
+            "Everything above was written, tested, and committed before this section "
+            "existed: 263 tests green, 5,000 simulation seeds green. The audit was run "
+            "anyway, on the premise that <b>a green suite is evidence the code does "
+            "what the tests say, not that the claims are true.</b> Four of the five "
+            "findings were claim errors rather than code errors, and no test was "
+            "failing for any of them.",
+            "body",
+        ),
+    ]
+    st.append(table(
+        [
+            ["Found", "Why it mattered"],
+            ["QuantLinear memoised the dequantized fp weight, so after one forward "
+             "pass an int4 layer held 26% MORE memory than the fp16 layer it "
+             "replaced — while stored_bytes() reported a 3.8x saving",
+             "Critical: every quantization memory claim in the project was false in "
+             "practice. Caching is now opt-in and off by default, and resident_bytes() "
+             "exists so the packed size and the real size cannot be conflated again."],
+            ["The speculation ablation ran at a batch above the adaptive gate, so 0 of "
+             "23 decode steps actually speculated",
+             "High: a row labelled \"speculation\" was measuring scheduling variance. "
+             "A dedicated suite now caps the batch so the mechanism is on the critical "
+             "path."],
+            ["memory_overhead() reported only weights, omitting the entire second KV "
+             "cache that QASSD allocates",
+             "Medium: the quoted number was true and incomplete — harder to catch than "
+             "a false one, because nothing about it looks wrong."],
+            ["The KV transfer FSM was listed as \"Built\" beside paged attention, when "
+             "nothing outside the test harness imports it",
+             "Medium: a verified design was presented as a shipped feature. Relabelled, "
+             "with the grep that proves it."],
+            ["A benchmark run was contaminated by a concurrent job on the same machine",
+             "Low: it inverted the γ=2 / γ=4 ordering. Re-run idle; the inversion "
+             "disappeared."],
+        ],
+        [64 * mm, 99 * mm],
+    ))
+    st += [
+        Spacer(1, 4 * mm),
+        P(
+            "Each fix carries a regression test, and each of those tests was "
+            "<b>mutation-checked</b>: the bug it exists to catch was deliberately "
+            "reintroduced and the test confirmed to fail. One result from that exercise "
+            "is worth more than the others. When the accept logic was mutated to commit "
+            "the draft's token instead of the verifier's, <b>every symmetric-speculation "
+            "parity test passed</b> &mdash; because at &alpha;&nbsp;=&nbsp;1.0 the draft "
+            "token and the verified token are identical, so the bug is invisible. Only "
+            "the asymmetric test failed.",
+            "body",
+        ),
+        P(
+            "That is the general lesson, and it is the same one section 2 records about "
+            "copy-on-write coverage, arriving from a different direction: <b>a test "
+            "suite can be large and green and still have no coverage of the thing that "
+            "matters.</b> The only reliable check is to break the code on purpose and "
+            "watch what fails.",
+            "body",
+        ),
+    ]
+
+    st += [PageBreak(), P("7 &nbsp; What is not built", "h1")]
     st.append(P(
         "This section exists because the project's governing rule was that a claim must "
         "never outrun its evidence &mdash; and the only way to keep that rule is to "
@@ -711,7 +843,7 @@ def build_story(d, figs: Dict[str, Path], prov: dict, helpers) -> list:
     ]
 
     # -------------------------------------------------------------- section 7
-    st += [P("7 &nbsp; What the process taught", "h1")]
+    st += [P("8 &nbsp; What the process taught", "h1")]
     st += [
         P("Three bugs were structurally invisible without real hardware", "h2"),
         P(

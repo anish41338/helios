@@ -212,11 +212,14 @@ class QuantLinear(torch.nn.Module):
         bias: bool = False,
         dtype: torch.dtype = torch.float32,
         device: str = "cpu",
+        cache_dequantized: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.cfg = cfg
+        # Off by default: see `dequantized()` for why caching defeats W4A16.
+        self.cache_dequantized = cache_dequantized
         gs = cfg.group_size if in_features % cfg.group_size == 0 else in_features
         n_groups = in_features // gs
 
@@ -244,6 +247,7 @@ class QuantLinear(torch.nn.Module):
         linear: torch.nn.Linear,
         cfg: QuantConfig,
         act_scale: Optional[torch.Tensor] = None,
+        cache_dequantized: bool = False,
     ) -> "QuantLinear":
         """Quantize an existing fp Linear, optionally with AWQ channel scales."""
         out_features, in_features = linear.weight.shape
@@ -254,6 +258,7 @@ class QuantLinear(torch.nn.Module):
             bias=linear.bias is not None,
             dtype=linear.weight.dtype,
             device=str(linear.weight.device),
+            cache_dequantized=cache_dequantized,
         )
         w = linear.weight.detach()
         dtype = w.dtype
@@ -274,20 +279,53 @@ class QuantLinear(torch.nn.Module):
     def dequantized(self) -> torch.Tensor:
         """The fp weight this layer represents, including the AWQ scaling.
 
-        Cached: the buffers are frozen after load, so recomputing per forward is
-        pure waste. `torch.inference_mode` means no autograd graph is held.
+        NOT cached by default, and that is the whole point.
+
+        An earlier version memoised this on the reasoning that "the buffers are
+        frozen after load, so recomputing per forward is pure waste". That
+        reasoning is wrong in a way that destroys the feature: holding the
+        dequantized fp weight resident alongside the packed int4 one means the
+        layer occupies MORE memory than the fp16 Linear it replaced. Measured on a
+        2048x2048 fp16 layer: 2.1 MiB packed, plus an 8 MiB cache, against 8 MiB
+        for plain fp16 -- a 1.26x *regression* presented as a 3.8x saving.
+
+        W4A16 exists to trade compute for memory. A cache that trades the memory
+        back is not an optimisation, it is a silent retraction of the mechanism.
+        So the dequantized tensor is transient: peak memory is the packed weights
+        for the whole model plus ONE layer's fp weight in flight, which is what
+        makes `stored_bytes()` an honest number.
+
+        `cache_dequantized=True` is available for a caller that has measured its
+        own situation and wants the speed, but it is opt-in and off by default,
+        because the default must not quietly contradict the docs.
         """
-        if self._deq_cache is None:
-            self._deq_cache = dequantize_weight(
-                self.qweight, self.scales, self.qzeros, self.in_features,
-                self.scales.dtype,
-            )
-        return self._deq_cache
+        if self._deq_cache is not None:
+            return self._deq_cache
+        w = dequantize_weight(
+            self.qweight, self.scales, self.qzeros, self.in_features,
+            self.scales.dtype,
+        )
+        if self.cache_dequantized:
+            self._deq_cache = w
+        return w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.act_scale is not None:
             x = x / self.act_scale
         return F.linear(x, self.dequantized(), self.bias)
+
+    def resident_bytes(self) -> int:
+        """Bytes actually held right now, including any dequantized cache.
+
+        Distinct from `stored_bytes()` on purpose. `stored_bytes()` is the packed
+        representation; this is what the process is really holding. They differ
+        exactly when caching is on, and conflating them is how the bug above
+        survived being "measured".
+        """
+        n = self.stored_bytes()
+        if self._deq_cache is not None:
+            n += self._deq_cache.numel() * self._deq_cache.element_size()
+        return n
 
     def _apply(self, *args, **kwargs):
         # Any device/dtype move invalidates the cached fp weight. Without this,
@@ -549,7 +587,7 @@ def quantize_model(
 
     total_quant = sum(p.numel() * p.element_size() for p in model.parameters())
     total_quant += sum(
-        m.stored_bytes() for m in model.modules() if isinstance(m, QuantLinear)
+        m.resident_bytes() for m in model.modules() if isinstance(m, QuantLinear)
     )
 
     return QuantReport(

@@ -496,6 +496,12 @@ ABLATIONS: Dict[str, Dict] = {
     "full": {},
     "no_prefix_cache": {"enable_prefix_cache": False},
     "no_chunked_prefill": {"enable_chunked_prefill": False},
+    # NOTE: at the default max_num_seqs=64 this ablation measures NOTHING.
+    # `_effective_gamma` disables speculation above spec_max_batch_size=8, and the
+    # default workload runs at mean batch 12-16, so the gate fires on every decode
+    # step (measured: 0/23 steps had gamma>0). The row is kept because "configured
+    # but correctly gated off" is a real configuration, but the ablation that
+    # actually exercises drafting is the `spec` suite below, which caps the batch.
     "with_spec_decode": {"enable_spec_decode": True, "spec_gamma": 4},
     "small_kv_pool": {"kv_cache_bytes": 8 * 1024 * 1024},
     "batch1": {"max_num_seqs": 1},
@@ -517,7 +523,7 @@ def main() -> None:
         "--suite",
         default="ablations",
         choices=["ablations", "baselines", "all", "quick", "prefill-heavy",
-                 "prefix-cache", "kv-quant"],
+                 "prefix-cache", "kv-quant", "spec"],
     )
     ap.add_argument("--static-batch-size", type=int, default=8)
     args = ap.parse_args()
@@ -597,6 +603,38 @@ def main() -> None:
             run_helios(
                 args.model, shared, {"enable_prefix_cache": False},
                 name="helios_shared_prefix_cache_off",
+            )
+        )
+
+    if args.suite in ("spec", "all"):
+        # Speculation only runs below spec_max_batch_size=8, so measuring it at the
+        # default max_num_seqs=64 measures the gate, not the mechanism -- 0 of 23
+        # decode steps had gamma>0 there. Capping the batch to 8 is what puts the
+        # draft loop on the critical path at all.
+        #
+        # Same class of methodology error as the prefix cache and the INT8 KV pool:
+        # a mechanism benchmarked outside its regime reads as a regression.
+        capped = {"max_num_seqs": 8}
+        print("[bench] running speculation ablation (batch capped to 8) ...", flush=True)
+        results.append(
+            run_helios(args.model, spec, capped, name="helios_spec_off_batch8")
+        )
+        for gamma in (2, 4):
+            results.append(
+                run_helios(
+                    args.model, spec,
+                    {**capped, "enable_spec_decode": True, "spec_gamma": gamma},
+                    name=f"helios_spec_g{gamma}_batch8",
+                )
+            )
+        # And the quantization-asymmetric variant, which is the one where
+        # acceptance is a real measurement rather than 1.0 by construction.
+        results.append(
+            run_helios(
+                args.model, spec,
+                {**capped, "enable_spec_decode": True, "spec_gamma": 2,
+                 "quantized_draft": True, "quant_group_size": 64},
+                name="helios_qassd_g2_batch8",
             )
         )
 

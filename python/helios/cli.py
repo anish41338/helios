@@ -289,7 +289,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ValueError as exc:
+        # Configuration errors are the user's problem to fix, not a crash to
+        # debug. A traceback here buries a one-line message under twenty lines of
+        # frames from inside the engine.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
