@@ -91,6 +91,53 @@ def device_report() -> dict:
     return info
 
 
+def check_staleness() -> dict:
+    """Compare the working tree against origin, and say so if it is behind.
+
+    Exists because a stale checkout burned a full GPU session: Kaggle's
+    /kaggle/working persists, so `git clone` into an existing directory fails
+    with "destination path already exists", the notebook keeps going, and the run
+    silently executes last session's code. The failures it then reports are
+    already-fixed bugs, which is worse than no run at all -- you debug the past.
+
+    Best-effort: a network failure here must not block a run, so it degrades to
+    "unknown" rather than raising.
+    """
+    out: dict = {"local": "unknown", "remote": "unknown", "behind": 0}
+    try:
+        out["local"] = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=str(ROOT),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        )
+        subprocess.run(
+            ["git", "fetch", "--quiet", "origin"], cwd=str(ROOT),
+            capture_output=True, timeout=60,
+        )
+        branch = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(ROOT),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        )
+        out["remote"] = (
+            subprocess.check_output(
+                ["git", "rev-parse", f"origin/{branch}"], cwd=str(ROOT),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        )
+        if out["local"] != out["remote"]:
+            count = subprocess.check_output(
+                ["git", "rev-list", "--count", f"HEAD..origin/{branch}"],
+                cwd=str(ROOT), stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            out["behind"] = int(count or 0)
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def main() -> int:
     record: dict = {}
 
@@ -99,6 +146,26 @@ def main() -> int:
     for k, v in info.items():
         print(f"  {k}: {v}")
     record["env"] = info
+
+    stale = check_staleness()
+    record["staleness"] = stale
+    if stale.get("behind"):
+        print(
+            "\n"
+            "!!! THIS CHECKOUT IS STALE !!!\n"
+            f"  local:  {stale['local'][:8]}\n"
+            f"  origin: {stale['remote'][:8]}  ({stale['behind']} commit(s) ahead)\n"
+            "\n"
+            "  Kaggle's /kaggle/working persists between sessions, so a "
+            "`git clone` into an existing directory fails silently and you run "
+            "OLD code -- including bugs that are already fixed upstream.\n"
+            "\n"
+            "  Fix it with:\n"
+            "      !cd helios && git pull\n"
+            "  or start clean:\n"
+            "      !rm -rf helios && git clone https://github.com/<you>/helios.git\n"
+        )
+        return 1
 
     if not info["cuda_available"]:
         print(
