@@ -11,7 +11,7 @@ than the transport.
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -22,8 +22,7 @@ from ..core.execstep import (
     FaultKind,
     SeqOutput,
 )
-from ..core.types import SamplingParams
-from .model import HeliosModel, ModelConfig
+from .model import HeliosModel
 from .paged_attn import PagedKVCache
 from .sampler import Sampler, greedy_token
 

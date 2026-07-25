@@ -10,7 +10,7 @@ requests happened to be in the batch, which makes bugs unreproducible.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 

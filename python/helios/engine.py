@@ -11,16 +11,15 @@ hardware rather than from a magic constant.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, List, Optional
 
 from .core.allocator import Allocator
 from .core.prefix_cache import PrefixCache
 from .core.scheduler import Scheduler, SchedulerConfig
 from .core.types import (
     CompletionOutput,
-    FinishReason,
     Request,
     SamplingParams,
     SeqId,
