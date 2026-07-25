@@ -74,7 +74,14 @@ def load_model(
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
 
     model = HeliosModel(config, device=device)
-    model = model.to(dtype)
+    # BOTH device and dtype. `HeliosModel(device=...)` only records the device for
+    # the tensors it creates at runtime and builds the RoPE cache there -- the
+    # nn.Embedding / nn.Linear submodules are constructed on CPU by default. A
+    # `.to(dtype)` alone left every weight on the host while inputs were built on
+    # cuda, which fails at the first embedding lookup with "Expected all tensors
+    # to be on the same device". Invisible on a CPU run, because there the two
+    # agree. Found by the smoke test in bench/real_model_check.py on a T4.
+    model = model.to(device=device, dtype=dtype)
 
     own = dict(model.named_parameters())
     assigned: set[str] = set()

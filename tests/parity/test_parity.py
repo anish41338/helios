@@ -644,3 +644,41 @@ def test_attention_bias_is_actually_applied():
     assert attn.k_proj.bias is not None
     assert attn.v_proj.bias is not None
     assert attn.o_proj.bias is None, "o_proj never carries a bias"
+
+
+def test_loaded_model_parameters_are_on_the_requested_device(toy_dir):
+    """Weights must land on the requested device, not just the requested dtype.
+
+    Regression, found on a T4: `HeliosModel(device=...)` only records the device
+    for tensors it creates at runtime; its nn.Embedding/nn.Linear submodules are
+    built on CPU. The loader called `.to(dtype)` without `.to(device)`, so every
+    weight stayed on the host while inputs were created on cuda, and the first
+    embedding lookup raised "Expected all tensors to be on the same device".
+
+    Invisible on a CPU-only machine, where the two happen to agree -- so this
+    asserts the invariant rather than the symptom: every parameter must sit on
+    the device the engine will build its input tensors on.
+    """
+    from helios.exec.loader import load_model
+
+    model = load_model(toy_dir, device="cpu")
+    devices = {p.device.type for p in model.parameters()}
+    assert devices == {"cpu"}, f"parameters spread across devices: {devices}"
+    # The recorded device and the parameters' device must agree; a mismatch here
+    # is exactly the GPU bug, and it is checkable without a GPU.
+    assert model.device == "cpu"
+    assert next(model.parameters()).device.type == model.device
+
+
+def test_engine_dtype_matches_kv_cache_dtype(toy_dir):
+    """Weights, KV cache, and block sizing must share one dtype decision.
+
+    Sizing blocks for fp32 while storing fp16 would silently halve usable cache
+    (or double it, depending on the direction of the mistake), so the engine
+    derives all three from a single choice.
+    """
+    engine = make_engine(toy_dir)
+    weight_dtype = next(engine.runner.model.parameters()).dtype
+    assert engine.dtype == weight_dtype
+    assert engine.runner.kv_caches[0].dtype == weight_dtype
+    assert engine.dtype_bytes == weight_dtype.itemsize

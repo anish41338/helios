@@ -10,6 +10,13 @@ venv/
 # Regenerable model weights (large, random).
 artifacts/bench_model/
 
+# Downloaded HuggingFace checkpoints. Never commit these: Qwen2.5-0.5B alone is
+# ~1 GB, GitHub rejects single files over 100 MB, and they are reproducible with
+# one snapshot_download call.
+artifacts/qwen05b/
+artifacts/*.safetensors
+artifacts/**/*.safetensors
+
 # Per-run benchmark records are regenerable via bench/loadgen.py. The DST
 # sweep logs are deliberately NOT ignored: spec section 19.3 requires every
 # claim to trace to an artifact, and docs/DST.md cites them.

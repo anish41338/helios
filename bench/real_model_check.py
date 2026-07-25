@@ -107,8 +107,7 @@ def main() -> int:
         "def add(a, b):",
     ]
 
-    dtype_note = "float32" if args.device == "cpu" else "float32 (see note)"
-    print(f"loading {args.model} on {args.device} ({dtype_note}) ...", flush=True)
+    print(f"loading {args.model} on {args.device} ...", flush=True)
     t0 = time.perf_counter()
     engine = LLMEngine(
         EngineConfig(
@@ -120,6 +119,8 @@ def main() -> int:
         )
     )
     print(f"  loaded in {time.perf_counter() - t0:.1f}s")
+    a_param = next(engine.runner.model.parameters())
+    print(f"  weights: dtype={a_param.dtype} device={a_param.device}")
     print(f"  kv blocks: {engine.num_blocks}  max_model_len: {engine.max_model_len}")
     print(f"  params: {engine.runner.model.num_parameters():,}")
 
