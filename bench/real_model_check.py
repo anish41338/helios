@@ -99,6 +99,11 @@ def main() -> int:
         default=None,
         help="repeatable; defaults to a small factual set",
     )
+    ap.add_argument(
+        "--download",
+        default="Qwen/Qwen2.5-0.5B",
+        help="HF repo to fetch if --model is missing; empty string disables",
+    )
     args = ap.parse_args()
 
     prompts = args.prompt or [
@@ -106,6 +111,27 @@ def main() -> int:
         "Water boils at",
         "def add(a, b):",
     ]
+
+    # Fetch the checkpoint if it is not there. The script is meant to be runnable
+    # standalone, and the weights are deliberately gitignored (a 1 GB file cannot
+    # be pushed), so "missing" is the normal state on a fresh clone.
+    model_dir = Path(args.model)
+    if not (model_dir / "config.json").exists():
+        if not args.download:
+            print(f"FAILED: {model_dir}/config.json not found and --download is off")
+            return 1
+        print(f"  {model_dir} is empty; downloading {args.download} ...", flush=True)
+        try:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(
+                args.download,
+                local_dir=str(model_dir),
+                allow_patterns=["*.json", "*.safetensors", "*.txt"],
+            )
+        except Exception as exc:
+            print(f"FAILED: could not download {args.download}: {exc}")
+            return 1
 
     print(f"loading {args.model} on {args.device} ...", flush=True)
     t0 = time.perf_counter()
