@@ -345,6 +345,58 @@ def test_max_tokens_and_eos_stop_conditions(toy_dir):
     assert out.finish_reason.value == "length"
 
 
+def test_stop_string_truncates_output(toy_dir):
+    """A `stop` string must terminate generation and be absent from the output.
+
+    Regression: `stop` was validated by the API and then never consulted, so a
+    client passing one had it silently ignored -- the same failure mode as
+    accepting an out-of-range max_tokens and quietly truncating.
+    """
+    params = SamplingParams(max_tokens=12, temperature=0.0)
+    base_engine = make_engine(toy_dir)
+    base_engine.add_request("plain", [5, 9], params)
+    base = base_engine.run_until_complete()[0]
+    assert base.finish_reason.value == "length"
+
+    # Choose a stop string that the unconstrained run is known to produce.
+    target = base.text[3:8]
+    assert target and target in base.text
+
+    stop_engine = make_engine(toy_dir)
+    stop_engine.add_request(
+        "stopped", [5, 9], SamplingParams(max_tokens=12, temperature=0.0, stop=[target])
+    )
+    stopped = stop_engine.run_until_complete()[0]
+
+    assert stopped.finish_reason.value == "stop"
+    assert target not in stopped.text, "the stop string must not appear in the output"
+    assert len(stopped.text) < len(base.text)
+    stop_engine.scheduler.check_invariants()
+
+
+def test_stop_token_id_finishes_sequence(toy_dir):
+    """Stop token ids are handled in the scheduler (a plain integer compare)."""
+    engine = make_engine(toy_dir)
+    engine.add_request("x", [5, 9], SamplingParams(max_tokens=8, temperature=0.0))
+    first = engine.run_until_complete()[0]
+
+    # Stop on the 3rd generated token (index 2). It is committed, then ends the
+    # sequence, so exactly 3 tokens come back.
+    stop_id = first.token_ids[2]
+    engine2 = make_engine(toy_dir)
+    engine2.add_request(
+        "y",
+        [5, 9],
+        SamplingParams(max_tokens=8, temperature=0.0, stop_token_ids=[stop_id]),
+    )
+    got = engine2.run_until_complete()[0]
+    assert got.finish_reason.value == "stop"
+    # The token ids before the stop must match the unconstrained run.
+    assert got.token_ids == first.token_ids[: len(got.token_ids)]
+    assert got.token_ids[-1] == stop_id, "generation ends on the stop token"
+    assert got.completion_tokens < 8, "stopped before max_tokens"
+
+
 def test_engine_rejects_prompt_over_context_limit(toy_dir):
     engine = make_engine(toy_dir, max_model_len=64)
     with pytest.raises(ValueError):

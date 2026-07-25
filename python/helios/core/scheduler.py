@@ -986,6 +986,15 @@ class Scheduler:
         seq.state = SeqState.FINISHED
         seq.finish_reason = reason
 
+    def finish_for_stop_string(self, seq: Sequence) -> None:
+        """Mark a sequence finished because a stop string matched.
+
+        Called by the engine, which owns the tokenizer -- stop-string detection
+        cannot live in this module without breaking its purity. The sequence is
+        left in `running` so the normal reaper frees its KV next step.
+        """
+        self._finish(seq, FinishReason.STOP_STRING)
+
     def _retire(self, seq: Sequence, reason: FinishReason) -> None:
         """Finish a sequence that is not in `running`, freeing its KV now.
 

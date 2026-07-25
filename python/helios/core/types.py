@@ -127,6 +127,11 @@ class Sequence:
     # Number of prompt tokens satisfied by a prefix-cache hit.
     cached_prefix_len: int = 0
 
+    # Set when a stop string truncated the output. Stop strings are detected
+    # outside the scheduler (they need a tokenizer), so the truncated text is
+    # carried here rather than recomputed.
+    output_text_override: Optional[str] = None
+
     # Length of the prefix-cache pin this sequence currently holds, in tokens.
     # Tracked separately from cached_prefix_len because the two diverge: a
     # sequence can hold a pin over more tokens than it reused (it pins what it

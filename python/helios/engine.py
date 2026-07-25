@@ -244,6 +244,8 @@ class LLMEngine:
         outputs = self.scheduler.step(self.runner)
         now = time.perf_counter()
 
+        self._apply_stop_strings(outputs)
+
         # First-token timing: record when a sequence's first output appears.
         for out in outputs.outputs:
             rid = self._seq_to_request.get(out.seq_id)
@@ -270,13 +272,52 @@ class LLMEngine:
         self._completed.extend(completed)
         return completed
 
+    def _apply_stop_strings(self, outputs) -> None:
+        """Terminate sequences whose decoded text contains a stop string.
+
+        Stop *strings* live here rather than in the scheduler because they need
+        detokenization, and the scheduler core must stay free of the tokenizer
+        (and of anything else that is not a pure function of its own state).
+        Stop *token ids* are handled in the scheduler, where they are just an
+        integer comparison.
+
+        Without this, a client passing `stop: ["\\n\\n"]` had it silently
+        ignored -- the parameter was validated and then never consulted.
+        """
+        for out in outputs.outputs:
+            seq = self.scheduler.get_sequence(out.seq_id)
+            if seq is None or seq.is_finished or not out.token_ids:
+                continue
+            stops = seq.request.params.stop
+            if not stops:
+                continue
+
+            text = self._decode_cached(seq)
+            for s in stops:
+                if s and s in text:
+                    # Truncate the output at the stop string so the client never
+                    # sees it, matching OpenAI's behaviour.
+                    cut = text.index(s)
+                    seq.output_text_override = text[:cut]
+                    self.scheduler.finish_for_stop_string(seq)
+                    break
+
+    def _decode_cached(self, seq: Sequence) -> str:
+        try:
+            return self.tokenizer.decode(seq.output_token_ids)
+        except Exception:
+            return ""
+
     def _make_output(self, seq: Sequence) -> CompletionOutput:
-        text = ""
-        if seq.output_token_ids:
+        if seq.output_text_override is not None:
+            text = seq.output_text_override   # truncated at a stop string
+        elif seq.output_token_ids:
             try:
                 text = self.tokenizer.decode(seq.output_token_ids)
             except Exception:
                 text = ""   # tokenizer unavailable; token ids are still returned
+        else:
+            text = ""
         return CompletionOutput(
             request_id=seq.request.request_id,
             token_ids=list(seq.output_token_ids),
