@@ -114,7 +114,16 @@ class LLMEngine:
         from .exec.loader import load_config, load_model
 
         self.model_config: ModelConfig = load_config(model_dir)
-        model = load_model(model_dir, device=config.device)
+        # One dtype decision, used for the weights, the KV cache, and the block
+        # sizing below. Deriving them separately is how you get a cache sized for
+        # fp32 holding fp16 tensors.
+        import torch as _torch
+
+        self.dtype = (
+            _torch.float16 if config.device.startswith("cuda") else _torch.float32
+        )
+        self.dtype_bytes = 2 if self.dtype is _torch.float16 else 4
+        model = load_model(model_dir, device=config.device, dtype=self.dtype)
 
         # Derive block count from the byte budget (spec section 5.2).
         bytes_per_block = Allocator.bytes_per_block(
@@ -122,7 +131,7 @@ class LLMEngine:
             n_kv_heads=self.model_config.num_key_value_heads,
             head_dim=self.model_config.head_dim,
             n_layers=self.model_config.num_hidden_layers,
-            dtype_bytes=4,   # fp32 on the CPU path
+            dtype_bytes=self.dtype_bytes,
         )
         num_blocks = max(8, config.kv_cache_bytes // bytes_per_block)
 
@@ -136,6 +145,7 @@ class LLMEngine:
             num_blocks=num_blocks,
             block_size=config.block_size,
             device=config.device,
+            dtype=self.dtype,
         )
 
         self.allocator = Allocator(

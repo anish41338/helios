@@ -68,7 +68,10 @@ def load_model(
     model_dir = Path(model_dir)
     config = load_config(model_dir)
     if dtype is None:
-        dtype = torch.float32  # CPU path; fp16 matmul on CPU is slow and lossy
+        # fp16 on CUDA, fp32 on CPU. fp16 matmul on CPU is emulated -- slow and
+        # lossy -- while on a GPU it halves both the weight read (the decode
+        # bottleneck) and the KV cache, and is what the tensor cores want.
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
 
     model = HeliosModel(config, device=device)
     model = model.to(dtype)
