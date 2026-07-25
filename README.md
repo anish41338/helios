@@ -48,7 +48,8 @@ I/O, no threads, no unseeded RNG, no iteration over unordered containers. That
 lets the whole system be driven from a seed under adversarial fault injection,
 single-threaded, asserting every invariant after every step.
 
-**50,000 seeds, 0 failures.** Any failure replays exactly:
+**2,500 seeds, 0 failures** on the current commit (a 20,000-seed run passed on
+an earlier one; see `docs/DST.md`). Any failure replays exactly:
 
 ```bash
 PYTHONPATH=python python -m helios.cli vopr --seed 918273 --replay
@@ -73,7 +74,7 @@ Full writeup with root causes and reproductions: [docs/DST.md](docs/DST.md).
 
 ## Correctness
 
-163 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
+166 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
 tolerance is never loosened to make a test pass):
 
 | Property | Guarantee |

@@ -41,7 +41,7 @@ could never be compiled, run, or benchmarked here.
 | Sampling (greedy, temp, top-k, top-p, per-request seeds) | 9.1 | Built |
 | Self-speculative decode structure + accept/rollback | 7.2 | Built (see caveat below) |
 | Adaptive speculation gating | 7.3 | Built (batch size + measured acceptance) |
-| Deterministic simulation testing | 10 | Built. 50k seeds, fault injection, replay |
+| Deterministic simulation testing | 10 | Built. Seed sweeps, fault injection, replay |
 | OpenAI-compatible HTTP API | 9.1 | Built (`/v1/completions`, `/v1/chat/completions`) |
 | Prometheus metrics | 9.2 | Built |
 | Benchmark harness + ablations | 11 | Built (Poisson arrivals, percentiles, goodput) |
@@ -128,7 +128,7 @@ Adapting the wording spec section 12.2 pre-approved:
 > chunked prefill, a radix-trie prefix cache, and an OpenAI-compatible API.
 > Validated the scheduler and allocator with a deterministic simulation testing
 > harness (TigerBeetle/FoundationDB style) under adversarial fault injection:
-> 50,000 seeds, seven invariants checked every step, every failure replayable
+> thousands of seeds, seven invariants checked every step, every failure replayable
 > from its seed. **The harness found 15 real bugs**, including a
 > copy-on-write accounting error that overshot the memory watermark and six
 > distinct admission/eviction livelocks — all documented with reproductions in
