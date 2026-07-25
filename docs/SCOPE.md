@@ -53,7 +53,7 @@ could never be compiled, run, or benchmarked here.
 | Missing | Spec section | Why |
 |---|---|---|
 | **Rust frontend + scheduler** | 3, 4 | Cut by section 12.2. Everything is Python |
-| **Triton/CUDA paged-attention kernel** | 8.3 | No GPU; Triton has no CPU target |
+| **Triton/CUDA paged-attention kernel** | 8.3 | **Written but UNVERIFIED** -- no GPU here to compile or validate it. See `docs/GPU.md`; the parity gate promotes it |
 | **W4A16 / AWQ / GPTQ quantization** | 8.2 | Needs GPU kernels to be meaningful |
 | **W4A4 draft path — the "QA" in QASSD** | 7.1 | Same. This is the core novelty claim and **it is not implemented** |
 | **Quantized KV shadow / dual-buffer** | 7.4 | Same |
