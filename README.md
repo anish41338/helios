@@ -106,11 +106,23 @@ The harness does Poisson arrivals, TTFT/TPOT/e2e percentiles, goodput against
 per-class SLO targets, and per-mechanism ablations. Two of the spec's four
 baselines are implemented (naive loop, static batching); vLLM needs CUDA.
 
-> A note on method: the first version of this harness reported one ablation as
-> 17× slower than an identical one. The cause was lazy-import cost landing
-> entirely on whichever configuration ran first. There is now a discarded warm-up
-> run. Worth stating because it is exactly the kind of artifact that turns into a
-> false claim.
+**The headline result is negative, and the report says so.** Continuous batching
+shows no throughput win here, because this executor runs one sequence per forward
+pass — a decode step costs ~5–7 ms *per resident sequence*, flat. Continuous
+batching's premise is that the batch dimension is nearly free (one fused kernel,
+N sequences), and with a serialized executor that premise fails. Static batching
+matches or beats it even on a workload with a 50× spread in output lengths and
+Poisson arrivals, so this is a property of the build, not a workload artifact.
+What the scheduler does deliver here is admission control, preemption, prefix
+reuse, and liveness under fault injection — verified by tests and DST rather than
+by a stopwatch. Details in [docs/SCOPE.md](docs/SCOPE.md).
+
+> Two method notes, since both are the kind of artifact that becomes a false
+> claim. (1) The first harness reported one ablation as 17× slower than an
+> identical one; the cause was lazy-import cost landing on whichever config ran
+> first, so there is now a discarded warm-up run. (2) The static-batching result
+> above was tested against its own explanation — the heterogeneous-length rerun
+> was an attempt to *confirm* continuous batching and instead refuted it.
 
 ## Layout
 

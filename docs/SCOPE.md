@@ -81,6 +81,34 @@ What it does establish: the scheduler's accept/rollback bookkeeping and KV
 truncation are correct, which is the part most likely to silently corrupt
 output. The quantization asymmetry that would make it fast is future work.
 
+## The serialized-executor limitation (read this before quoting throughput)
+
+The executor runs **one sequence per forward pass**, in a Python loop
+(`exec/runner.py`). The scheduler emits properly batched `ExecStep`s — batching
+the executor later needs no scheduler change — but today the batch dimension is
+not exploited by a fused kernel.
+
+Measured consequence: a decode step costs ~5–7 ms **per resident sequence**,
+flat, regardless of batch size. On a GPU, one fused kernel would serve N
+sequences for roughly the cost of one.
+
+This matters because it removes continuous batching's entire premise. If keeping
+a slot full costs full price, there is nothing to gain from filling it
+immediately. So:
+
+- **continuous batching shows no throughput win in this build**, and the
+  generated `BENCHMARKS.md` says so;
+- static batching matches or beats it, even on a workload with a 50× spread in
+  output lengths and Poisson arrivals (checked explicitly — it is not a workload
+  artifact);
+- what the scheduler demonstrably provides here is admission control,
+  preemption under memory pressure, prefix reuse, and liveness under fault
+  injection — properties verified by tests and DST, not by a stopwatch.
+
+Do not claim a batching speedup from this repository. The correct claim is that
+the mechanism is implemented and verified correct; the performance case for it
+requires a batched kernel and a GPU.
+
 ## What the benchmarks do and do not show
 
 `docs/BENCHMARKS.md` is generated from JSON artifacts by `bench/report.py` and
