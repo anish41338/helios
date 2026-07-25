@@ -139,10 +139,16 @@ names (§9.2), the DST fault taxonomy (§10.2), and the benchmark methodology
 (§11).
 
 **Adapted**: Python instead of Rust (§12.2 authorises this); direct call instead
-of shm IPC; gather+SDPA instead of a Triton kernel (the spec's own fallback
-path); one sequence per forward pass in the executor rather than a batched kernel
-— the scheduler still emits properly batched `ExecStep`s, so batching the
-executor later needs no scheduler change.
+of shm IPC; vectorised gather+SDPA instead of a Triton kernel (the spec's own
+fallback path). The executor batches an entire `ExecStep` into one forward pass —
+all decoding sequences share single GEMMs for the projections and MLP, with
+attention per sequence over its own paged KV — which is the CPU-available
+equivalent of what a fused kernel would do.
+
+Note how the `ExecStep` seam paid off: making the executor batched required **no
+scheduler change at all**, because the scheduler was already emitting properly
+batched steps. That is the argument for putting the boundary at plain data rather
+than at tensors.
 
 **Added** (not in the spec, required by bugs the harness found): the
 growth-headroom reservation at admission, the starvation backstop keyed on

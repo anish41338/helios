@@ -47,13 +47,25 @@ every forward pass: a sequence that emits EOS leaves immediately and a waiting
 sequence takes its slot in the *same* iteration. `_reap_finished` runs before
 `_admit` precisely so the freed blocks are available that step.
 
-**Honest caveat:** this build shows **no throughput win** from it, because the
-executor runs one sequence per forward pass (~5–7 ms per resident sequence,
-flat). Continuous batching's premise is that the batch dimension is nearly free —
-one fused kernel, N sequences — and a serialized executor breaks that premise. I
-tested the mechanism's precondition rather than assuming: with a 50× spread in
-output lengths and Poisson arrivals, static batching still won (0.91×). So it is
-a property of the build, not the workload. See `SCOPE.md`.
+**Measured:** 1.13× throughput over static batching on a mixed workload, and
+2.24× from batching the executor's decode step (`baseline_unbatched_executor`
+ablates only that). Mean resident decode batch 11.6.
+
+**The story worth telling here**, because it is the most useful thing I learned:
+the first version of this engine ran one sequence per forward pass, so continuous
+batching showed **no** win at all, and static batching beat it. I documented that
+as a GPU-dependent limitation — the premise being that batching only pays when a
+fused kernel makes the batch dimension nearly free. That conclusion was wrong. A
+bare matmul microbenchmark showed ~10× from batching the GEMMs on this CPU at
+N=32, so the win was an implementation shortcut away the whole time. Batching the
+executor turned a documented negative result into 2.24×.
+
+Two things I took from it: I had rationalised a missing optimisation as a hardware
+constraint, and my benchmark could not tell the difference. The harness now
+reports `mean_decode_batch` for exactly that reason — a throughput number from a
+run averaging one resident sequence measures nothing, and an earlier misleading
+comparison came from precisely that (sparse Poisson arrivals against static
+batching fed everything at t=0).
 
 **Admission policy, and how starvation is avoided?**
 Sort by `(slo_class, arrival_step, seq_id)`, then per-class token buckets refilled
@@ -93,10 +105,18 @@ contention is the motivation for the spec's disaggregation (not built).
 **Roofline for a decode step?**
 For an 8B model at W4A16, weights ≈ 5.7 GB read per step. On a 4090 (~1008 GB/s)
 that floors a single decode step at ≈ 5.7 ms, i.e. ~175 tok/s ceiling at batch 1
-regardless of FLOPs — which is why batching matters for throughput and why
-speculation (multiple tokens per weight read) helps latency. On this CPU build
-the measured ~5–7 ms/step is bandwidth- and Python-overhead-bound on a toy model,
-so it is not comparable.
+regardless of FLOPs.
+
+The consequence is the important part: that floor is per *step*, not per
+sequence, because the weight read is shared by everything in the batch. So batch
+1 wastes almost all of the machine — you pay the full weight read for one token.
+That is exactly why batching is a throughput mechanism and why speculation (more
+tokens per weight read) is a latency mechanism; they attack the same ratio from
+opposite sides.
+
+This build's absolute numbers are not comparable — CPU, toy model, fp32 — but the
+*shape* held: batching the decode step gave 2.24×, because it amortises one
+weight read across 11.6 sequences on average instead of one.
 
 **Why does online softmax avoid materialising the score matrix?**
 Softmax is normally two passes (find max, then exponentiate/sum). The streaming
@@ -225,8 +245,14 @@ exposing a pin leak underneath it.
   claim to novelty, 70B pipeline parallel, a vLLM baseline. All enumerated in
   `SCOPE.md`.
 - **What my numbers do not prove:** nothing about GPU performance, nothing about
-  quantized inference, nothing about α for QASSD, and — importantly — **not** that
-  continuous batching is faster, because in this build it isn't and I say so.
+  quantized inference, and nothing about α for QASSD. The batching and prefix-cache
+  ratios are real but CPU-and-toy-model bound; they show the mechanisms work, not
+  what they would do on a 4090 against vLLM.
+- **A conclusion I got wrong and corrected:** I documented "continuous batching
+  needs a GPU to pay" as a finding. It was a missing optimisation in my own
+  executor. Worth volunteering, because the interesting question is not whether I
+  hit the target but whether my measurements could tell me when I was wrong — and
+  initially they could not.
 - **What they do support:** the mechanisms are implemented and verified correct
   (bit-exact parity on chunked prefill, speculation, and paged vs dense
   attention), and the scheduler survives 50,000 adversarial simulated runs with
