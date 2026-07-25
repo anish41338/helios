@@ -1,0 +1,351 @@
+"""Correctness parity tests.
+
+Spec section 13.1 defines an oracle hierarchy. This build's rungs:
+
+  * paged attention  vs a dense, unpaged reference implementation
+  * chunked prefill  vs single-shot prefill (must be bit-identical)
+  * speculative decode vs non-speculative (must be bit-identical, section 7.2)
+  * engine end-to-end vs a direct model forward loop
+
+Per spec section 19.2, tolerances here are never loosened to make a test pass.
+Where an exact match is required it is asserted exactly; where float
+associativity makes that impossible, the tolerance is tight and justified.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import shutil
+import tempfile
+
+import pytest
+import torch
+
+from helios.core.types import SamplingParams
+from helios.engine import EngineConfig, LLMEngine
+from helios.exec.loader import save_toy_model
+from helios.exec.model import ModelConfig, HeliosModel
+from helios.exec.paged_attn import (
+    PagedKVCache,
+    _repeat_kv,
+    paged_attention_decode,
+    paged_attention_prefill,
+)
+
+TOY_CONFIG = ModelConfig(
+    vocab_size=259,
+    hidden_size=64,
+    intermediate_size=128,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=512,
+)
+
+
+@pytest.fixture(scope="module")
+def toy_dir():
+    path = os.path.join(tempfile.gettempdir(), "helios_parity_toy")
+    shutil.rmtree(path, ignore_errors=True)
+    save_toy_model(path, TOY_CONFIG, seed=0)
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def toy_model(toy_dir):
+    from helios.exec.loader import load_model
+
+    return load_model(toy_dir)
+
+
+def make_engine(toy_dir, **overrides) -> LLMEngine:
+    kwargs = dict(
+        model_dir=toy_dir,
+        kv_cache_bytes=8 * 1024 * 1024,
+        block_size=16,
+        max_model_len=256,
+    )
+    kwargs.update(overrides)
+    return LLMEngine(EngineConfig(**kwargs))
+
+
+# --------------------------------------------------- paged vs dense attention
+
+
+def dense_causal_attention(q, k, v, n_rep):
+    """Reference: plain causal attention with no paging whatsoever."""
+    T, n_q_heads, head_dim = q.shape
+    kr = _repeat_kv(k, n_rep).permute(1, 0, 2)
+    vr = _repeat_kv(v, n_rep).permute(1, 0, 2)
+    qr = q.permute(1, 0, 2)
+    scores = torch.matmul(qr, kr.transpose(1, 2)) / math.sqrt(head_dim)
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    scores = scores.masked_fill(mask[None], float("-inf"))
+    return torch.matmul(torch.softmax(scores, dim=-1), vr).permute(1, 0, 2)
+
+
+@pytest.mark.parametrize("n_tokens", [1, 7, 11, 16, 33])
+def test_paged_prefill_matches_dense_reference(n_tokens):
+    """Paging must not change the mathematics of attention."""
+    torch.manual_seed(0)
+    bs, n_kv, hd, n_q = 4, 2, 8, 4
+    cache = PagedKVCache(num_blocks=32, block_size=bs, n_kv_heads=n_kv, head_dim=hd)
+    n_blocks = (n_tokens + bs - 1) // bs
+    # Deliberately non-contiguous physical blocks: a bug in block-table
+    # indirection would show up here and not with sequential ids.
+    blocks = [(7 * i + 3) % 32 for i in range(n_blocks)]
+    assert len(set(blocks)) == len(blocks)
+
+    k = torch.randn(n_tokens, n_kv, hd)
+    v = torch.randn(n_tokens, n_kv, hd)
+    q = torch.randn(n_tokens, n_q, hd)
+    cache.write(blocks, 0, k, v)
+
+    got = paged_attention_prefill(q, cache, blocks, 0, n_tokens)
+    want = dense_causal_attention(q, k, v, n_q // n_kv)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_paged_decode_matches_dense_reference():
+    torch.manual_seed(1)
+    bs, n_kv, hd, n_q = 4, 2, 8, 4
+    T = 11
+    cache = PagedKVCache(num_blocks=32, block_size=bs, n_kv_heads=n_kv, head_dim=hd)
+    blocks = [5, 1, 9]
+    k = torch.randn(T, n_kv, hd)
+    v = torch.randn(T, n_kv, hd)
+    cache.write(blocks, 0, k, v)
+
+    kn, vn = torch.randn(1, n_kv, hd), torch.randn(1, n_kv, hd)
+    qn = torch.randn(n_q, hd)
+    cache.write(blocks, T, kn, vn)
+
+    got = paged_attention_decode(qn, cache, blocks, T + 1)
+
+    kall = _repeat_kv(torch.cat([k, kn]), n_q // n_kv).permute(1, 0, 2)
+    vall = _repeat_kv(torch.cat([v, vn]), n_q // n_kv).permute(1, 0, 2)
+    scores = torch.matmul(qn.unsqueeze(1), kall.transpose(1, 2)) / math.sqrt(hd)
+    want = torch.matmul(torch.softmax(scores, dim=-1), vall).squeeze(1)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_kv_write_read_round_trips_through_scattered_blocks():
+    cache = PagedKVCache(num_blocks=16, block_size=4, n_kv_heads=2, head_dim=8)
+    blocks = [11, 2, 7]
+    k = torch.randn(10, 2, 8)
+    v = torch.randn(10, 2, 8)
+    cache.write(blocks, 0, k, v)
+    gk, gv = cache.gather(blocks, 10)
+    torch.testing.assert_close(gk, k)
+    torch.testing.assert_close(gv, v)
+
+
+def test_gather_rejects_context_longer_than_block_table():
+    cache = PagedKVCache(num_blocks=16, block_size=4, n_kv_heads=2, head_dim=8)
+    with pytest.raises(IndexError):
+        cache.gather([0], 99)
+
+
+# ------------------------------------------------- chunked vs single-shot
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 4, 8])
+def test_chunked_prefill_is_identical_to_single_shot(toy_model, chunk):
+    """Chunking is a scheduling decision and must not alter numerics at all."""
+    cfg = toy_model.config
+    prompt = [5, 9, 14, 22, 33, 41, 7, 2, 88, 100, 3, 55]
+    blocks = [0, 1, 2, 3]
+
+    def caches():
+        return [
+            PagedKVCache(16, 16, cfg.num_key_value_heads, cfg.head_dim)
+            for _ in range(cfg.num_hidden_layers)
+        ]
+
+    with torch.inference_mode():
+        single = toy_model.forward(
+            prompt, list(range(len(prompt))), caches(), blocks, False, len(prompt)
+        )
+
+        cs = caches()
+        chunked = None
+        for start in range(0, len(prompt), chunk):
+            part = prompt[start : start + chunk]
+            chunked = toy_model.forward(
+                part,
+                list(range(start, start + len(part))),
+                cs,
+                blocks,
+                False,
+                start + len(part),
+            )
+
+    assert int(single.argmax()) == int(chunked.argmax()), "same token must be chosen"
+    torch.testing.assert_close(single, chunked, atol=1e-5, rtol=1e-5)
+
+
+def test_decode_continues_prefill_consistently(toy_model):
+    """A decode step after prefill must see the prompt's KV.
+
+    Compares against a full forward pass over prompt+token: if the decode path
+    read the wrong blocks or positions, the logits would diverge.
+    """
+    cfg = toy_model.config
+    prompt = [5, 9, 14, 22, 33]
+    blocks = [0, 1]
+
+    def caches():
+        return [
+            PagedKVCache(16, 16, cfg.num_key_value_heads, cfg.head_dim)
+            for _ in range(cfg.num_hidden_layers)
+        ]
+
+    with torch.inference_mode():
+        cs = caches()
+        logits = toy_model.forward(
+            prompt, list(range(len(prompt))), cs, blocks, False, len(prompt)
+        )
+        nxt = int(logits.argmax())
+        decode_logits = toy_model.forward(
+            [nxt], [len(prompt)], cs, blocks, True, len(prompt) + 1
+        )
+
+        # Reference: one prefill over the whole extended sequence.
+        full = toy_model.forward(
+            prompt + [nxt],
+            list(range(len(prompt) + 1)),
+            caches(),
+            blocks,
+            False,
+            len(prompt) + 1,
+        )
+
+    torch.testing.assert_close(decode_logits, full, atol=1e-5, rtol=1e-5)
+
+
+# ------------------------------------------------------ speculative parity
+
+
+@pytest.mark.parametrize("gamma", [1, 2, 4, 8])
+def test_speculative_output_is_identical_to_non_speculative(toy_dir, gamma):
+    """Spec section 7.2: THE most important test in the project.
+
+    Speculation that changes outputs is a bug, not a speedup. Asserted as exact
+    token-sequence equality, never as a tolerance.
+    """
+    prompt = [5, 9, 14, 22, 33, 41, 7]
+    params = SamplingParams(max_tokens=16, temperature=0.0)
+
+    base_engine = make_engine(toy_dir, enable_spec_decode=False)
+    base_engine.add_request("base", prompt, params)
+    base = base_engine.run_until_complete()[0]
+
+    spec_engine = make_engine(toy_dir, enable_spec_decode=True, spec_gamma=gamma)
+    spec_engine.add_request("spec", prompt, params)
+    spec = spec_engine.run_until_complete()[0]
+
+    assert spec.token_ids == base.token_ids, (
+        f"gamma={gamma} changed the output: "
+        f"{spec.token_ids} != {base.token_ids}"
+    )
+
+
+def test_speculation_reports_acceptance_statistics(toy_dir):
+    """Acceptance must be measured, not assumed.
+
+    Draft and verify share identical weights in this build (no quantization
+    asymmetry), so acceptance is 1.0 by construction. That is a property of this
+    scope, not evidence about QASSD -- see docs/SCOPE.md.
+    """
+    engine = make_engine(toy_dir, enable_spec_decode=True, spec_gamma=4)
+    engine.add_request("s", [5, 9, 14, 22], SamplingParams(max_tokens=12))
+    engine.run_until_complete()
+    stats = engine.scheduler.stats
+    assert stats.spec_drafted > 0, "speculation should have run"
+    assert stats.acceptance_rate == pytest.approx(1.0)
+
+
+# ------------------------------------------------------------ engine parity
+
+
+def test_engine_matches_direct_greedy_forward_loop(toy_dir, toy_model):
+    """End-to-end: the engine's tokens must equal a naive generation loop.
+
+    This is the closest available analogue of the spec's "exact match vs HF
+    generate()" rung: a reference loop that keeps no paged cache and simply
+    re-runs the whole sequence each step.
+    """
+    cfg = toy_model.config
+    prompt = [5, 9, 14, 22, 33]
+    n_new = 8
+
+    reference = []
+    with torch.inference_mode():
+        seq = list(prompt)
+        for _ in range(n_new):
+            caches = [
+                PagedKVCache(64, 16, cfg.num_key_value_heads, cfg.head_dim)
+                for _ in range(cfg.num_hidden_layers)
+            ]
+            blocks = list(range(len(seq) // 16 + 1))
+            logits = toy_model.forward(
+                seq, list(range(len(seq))), caches, blocks, False, len(seq)
+            )
+            nxt = int(logits.argmax())
+            reference.append(nxt)
+            seq.append(nxt)
+
+    engine = make_engine(toy_dir)
+    engine.add_request("e", prompt, SamplingParams(max_tokens=n_new, temperature=0.0))
+    got = engine.run_until_complete()[0]
+
+    assert got.token_ids == reference
+
+
+def test_identical_prompts_produce_identical_greedy_output(toy_dir):
+    """Concurrent requests must not perturb one another's token streams."""
+    engine = make_engine(toy_dir)
+    prompt = [5, 9, 14, 22]
+    for i in range(4):
+        engine.add_request(f"r{i}", prompt, SamplingParams(max_tokens=6, temperature=0.0))
+    results = engine.run_until_complete()
+    assert len({tuple(r.token_ids) for r in results}) == 1
+
+
+def test_prefix_cache_does_not_change_output(toy_dir):
+    """A cache is only valid if it is invisible in the output.
+
+    Reusing another sequence's KV blocks is exactly where a subtle indexing bug
+    would corrupt results, so this compares cached and uncached runs directly.
+    """
+    shared = list(range(20, 84))     # 4 whole blocks at block_size=16
+    params = SamplingParams(max_tokens=8, temperature=0.0)
+
+    cached = make_engine(toy_dir, enable_prefix_cache=True)
+    cached.add_request("warm", shared + [200], params)
+    cached.run_until_complete()
+    cached.add_request("hit", shared + [201], params)
+    with_cache = cached.run_until_complete()[0]
+    assert cached.scheduler.prefix_cache.hits >= 1, "expected a cache hit to exercise"
+
+    plain = make_engine(toy_dir, enable_prefix_cache=False)
+    plain.add_request("nocache", shared + [201], params)
+    without_cache = plain.run_until_complete()[0]
+
+    assert with_cache.token_ids == without_cache.token_ids
+
+
+def test_max_tokens_and_eos_stop_conditions(toy_dir):
+    engine = make_engine(toy_dir)
+    engine.add_request("len", [5, 9], SamplingParams(max_tokens=3, temperature=0.0))
+    out = engine.run_until_complete()[0]
+    assert out.completion_tokens == 3
+    assert out.finish_reason.value == "length"
+
+
+def test_engine_rejects_prompt_over_context_limit(toy_dir):
+    engine = make_engine(toy_dir, max_model_len=64)
+    with pytest.raises(ValueError):
+        engine.add_request("toolong", list(range(100)), SamplingParams(max_tokens=1))

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Regenerable model weights (large, random).
+artifacts/bench_model/
+
+# Per-run benchmark records are regenerable via bench/loadgen.py. The DST
+# sweep logs are deliberately NOT ignored: spec section 19.3 requires every
+# claim to trace to an artifact, and docs/DST.md cites them.
+artifacts/helios_*.json
+artifacts/baseline_*.json
