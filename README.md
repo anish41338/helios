@@ -74,7 +74,7 @@ Full writeup with root causes and reproductions: [docs/DST.md](docs/DST.md).
 
 ## Correctness
 
-172 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
+173 tests. The parity tests are the backbone, per spec §13.1 and §19.2 (a
 tolerance is never loosened to make a test pass):
 
 | Property | Guarantee |
@@ -85,6 +85,7 @@ tolerance is never loosened to make a test pass):
 | Prefix cache on vs off | identical output |
 | Engine vs naive generation loop | identical tokens |
 | Batched vs sequential decode | identical logits, and order-invariant |
+| Output under forced preemption | identical after 14 recompute cycles |
 | Allocator I1–I7 | asserted after every op, 40 randomized walks |
 
 ```bash

@@ -477,6 +477,48 @@ def test_engine_output_unchanged_by_decode_batching(toy_dir):
     assert got == want
 
 
+def test_output_survives_recompute_preemption(toy_dir):
+    """Tokens must be unchanged by preemption and recompute.
+
+    Recompute discards a sequence's KV entirely and re-prefills prompt plus
+    everything already generated. Any error in position bookkeeping, block-table
+    rebuilding, or the re-prefill path would corrupt the sequence -- and produce
+    fluent, wrong text rather than a crash. This is the seam between the
+    scheduler (which DST covers with a simulated executor) and the real model, so
+    it is verified against actual logits.
+    """
+    prompts = [[5, 9, 14, 22, 33, 41, 7, 2], [88, 100, 3], [55, 66, 77, 88, 99, 11]]
+    params = SamplingParams(max_tokens=14, temperature=0.0)
+
+    def run(force_preempt: bool):
+        engine = make_engine(toy_dir)
+        if force_preempt:
+            sched = engine.scheduler
+            original = sched._ensure_running_can_progress
+
+            def aggressive():
+                # Preempt the newest running sequence every step there is more
+                # than one, forcing repeated recompute.
+                if len(sched.running) > 1:
+                    sched._preempt(sched.running[-1])
+                original()
+
+            sched._ensure_running_can_progress = aggressive
+
+        for i, p in enumerate(prompts):
+            engine.add_request(f"r{i}", p, params)
+        out = {o.request_id: tuple(o.token_ids) for o in engine.run_until_complete()}
+        return out, engine.scheduler.stats.preemptions_recompute
+
+    baseline, quiet = run(False)
+    preempted, count = run(True)
+
+    assert count > 0, "the test must actually cause preemptions to be meaningful"
+    assert preempted == baseline, (
+        f"output changed after {count} recompute preemptions"
+    )
+
+
 def test_stop_string_truncates_output(toy_dir):
     """A `stop` string must terminate generation and be absent from the output.
 
