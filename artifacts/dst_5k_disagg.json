@@ -1,0 +1,11 @@
+{
+  "seeds": 5000,
+  "start_seed": 0,
+  "passed": 5000,
+  "failures": [],
+  "max_steps": 4000,
+  "commit": "274fa7a6cada82a8badcedc41b0544bab730da6b",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "timestamp": "2026-07-25T18:15:37",
+  "command": "python -m helios.cli vopr --seeds 5000 --start 0 --max-steps 4000"
+}

@@ -32,6 +32,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             enable_chunked_prefill=not args.no_chunked_prefill,
             enable_spec_decode=args.spec_decode,
             spec_gamma=args.spec_gamma,
+            quantize_kv=args.quantize_kv,
+            quantized_draft=args.quantized_draft,
         )
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
@@ -50,8 +52,13 @@ def cmd_generate(args: argparse.Namespace) -> int:
             max_model_len=args.max_model_len,
             enable_spec_decode=args.spec_decode,
             spec_gamma=args.spec_gamma,
+            quantize_kv=args.quantize_kv,
+            quantized_draft=args.quantized_draft,
         )
     )
+    if engine.dual is not None:
+        print(engine.dual.report.summary())
+        print(engine.dual.summary())
     params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -209,6 +216,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--kv-mb", type=int, default=512, help="KV cache budget in MiB")
         p.add_argument("--block-size", type=int, default=16)
         p.add_argument("--max-model-len", type=int, default=None)
+        p.add_argument(
+            "--quantize-kv",
+            action="store_true",
+            help="INT8 paged KV cache: ~2x smaller, so ~2x the resident sequences "
+                 "at the same budget (spec 7.4)",
+        )
+        p.add_argument(
+            "--quantized-draft",
+            action="store_true",
+            help="QASSD: draft speculation from a 4-bit view of the same weights. "
+                 "Requires --spec-decode; costs ~+50%% weight memory (spec 7.1)",
+        )
 
     p = sub.add_parser("serve", help="run the OpenAI-compatible HTTP server")
     add_engine_args(p)

@@ -47,6 +47,18 @@ class EngineConfig:
     spec_gamma: int = 4
     watermark: float = 0.01
     tokenizer_dir: Optional[str] = None
+    # INT8 paged KV storage with per-token scales (spec section 7.4). Roughly
+    # doubles the number of resident sequences at the same byte budget, at a
+    # bounded accuracy cost measured in tests/quant/test_kv_quant.py.
+    quantize_kv: bool = False
+    # QASSD (spec section 7): draft speculation from a 4-bit view of the same
+    # weights instead of from the target itself. Costs +25% weight memory, and is
+    # only meaningful with enable_spec_decode.
+    quantized_draft: bool = False
+    quant_group_size: int = 128
+    # Prompts used to calibrate AWQ scales for the draft. Without them the draft
+    # is plain round-to-nearest, which measurably accepts less often.
+    quant_calib_prompts: Optional[List[str]] = None
 
 
 @dataclass
@@ -125,13 +137,19 @@ class LLMEngine:
         self.dtype_bytes = 2 if self.dtype is _torch.float16 else 4
         model = load_model(model_dir, device=config.device, dtype=self.dtype)
 
-        # Derive block count from the byte budget (spec section 5.2).
+        # Derive block count from the byte budget (spec section 5.2). A quantized
+        # cache stores int8 payload plus one fp16 scale per (token, head), and
+        # both terms go into the divisor -- otherwise the engine hands out more
+        # blocks than the cache can hold.
+        kv_dtype_bytes = 1 if config.quantize_kv else self.dtype_bytes
+        scale_bytes = 2 if config.quantize_kv else 0
         bytes_per_block = Allocator.bytes_per_block(
             block_size=config.block_size,
             n_kv_heads=self.model_config.num_key_value_heads,
             head_dim=self.model_config.head_dim,
             n_layers=self.model_config.num_hidden_layers,
-            dtype_bytes=self.dtype_bytes,
+            dtype_bytes=kv_dtype_bytes,
+            scale_bytes_per_token=scale_bytes,
         )
         num_blocks = max(8, config.kv_cache_bytes // bytes_per_block)
 
@@ -140,12 +158,16 @@ class LLMEngine:
         # keep, so clamp it and let add_request reject anything above.
         max_len = min(max_len, num_blocks * config.block_size)
 
+        self.dual = self._build_dual(model, config)
+
         self.runner = ModelRunner(
             model=model,
             num_blocks=num_blocks,
             block_size=config.block_size,
             device=config.device,
             dtype=self.dtype,
+            kv_quant=config.quantize_kv,
+            dual=self.dual,
         )
 
         self.allocator = Allocator(
@@ -178,6 +200,39 @@ class LLMEngine:
         self._metrics: Dict[str, RequestMetrics] = {}
         self._seq_to_request: Dict[SeqId, str] = {}
         self._completed: List[CompletionOutput] = []
+        # request_id -> pending text deltas, for streaming clients. Populated only
+        # for requests that called open_stream, so a non-streaming workload pays
+        # nothing (not even the incremental detokenize).
+        self._stream_queues: Dict[str, List[str]] = {}
+        self._stream_sent: Dict[str, int] = {}
+
+    def _build_dual(self, model, config: EngineConfig):
+        """Build the int4 draft view, if QASSD is enabled.
+
+        Requires speculation to be on: an int4 copy that nothing drafts from is
+        pure memory overhead, so asking for one without speculation is a config
+        error rather than something to silently ignore.
+        """
+        if not config.quantized_draft:
+            return None
+        if not config.enable_spec_decode:
+            raise ValueError(
+                "quantized_draft=True requires enable_spec_decode=True: the int4 "
+                "draft copy costs +25% weight memory and is only read by the "
+                "speculative path"
+            )
+
+        from .exec.qassd import DualPrecisionModel
+        from .exec.quant import QuantConfig
+
+        calib = None
+        if config.quant_calib_prompts:
+            calib = [self.tokenizer.encode(p) for p in config.quant_calib_prompts]
+        return DualPrecisionModel(
+            model,
+            QuantConfig(group_size=config.quant_group_size),
+            calib_token_ids=calib,
+        )
 
     # ------------------------------------------------------------- tokenizer
 
@@ -254,6 +309,7 @@ class LLMEngine:
         now = time.perf_counter()
 
         self._apply_stop_strings(outputs)
+        self._emit_deltas(outputs)
 
         # First-token timing: record when a sequence's first output appears.
         for out in outputs.outputs:
@@ -280,6 +336,58 @@ class LLMEngine:
 
         self._completed.extend(completed)
         return completed
+
+    # --------------------------------------------------------------- streaming
+
+    def _emit_deltas(self, outputs) -> None:
+        """Queue incremental text for every sequence that produced tokens.
+
+        Streaming is built on a per-request delta queue drained by the frontend,
+        rather than a callback, because the engine is single-threaded and the
+        frontend is async: a callback would run arbitrary user code inside the
+        scheduler step, which is exactly what the determinism contract forbids
+        (spec section 19.4). A queue keeps the seam.
+
+        Detokenization is incremental and this is the subtle part. A BPE token is
+        not a character, so decoding each token id alone produces mojibake for
+        anything multi-byte -- an emoji or a CJK character spans several tokens.
+        Decoding the whole output every step and taking the new suffix is correct
+        by construction: the tokenizer sees the full context it needs, and a
+        partial character simply does not appear in the decoded string until its
+        last token arrives. Cost is O(output_len) per step, which is why the
+        decoded prefix length is cached rather than the string re-diffed.
+        """
+        if not self._stream_queues:
+            return
+        for out in outputs.outputs:
+            if not out.token_ids:
+                continue
+            rid = self._seq_to_request.get(out.seq_id)
+            queue = self._stream_queues.get(rid) if rid else None
+            if queue is None:
+                continue
+            seq = self.scheduler.get_sequence(out.seq_id)
+            if seq is None:
+                continue
+            try:
+                text = self.tokenizer.decode(seq.output_token_ids)
+            except Exception:
+                continue
+            sent = self._stream_sent.get(rid, 0)
+            if len(text) > sent:
+                queue.append(text[sent:])
+                self._stream_sent[rid] = len(text)
+
+    def open_stream(self, request_id: str) -> List[str]:
+        """Register `request_id` for incremental deltas. Returns its queue."""
+        queue: List[str] = []
+        self._stream_queues[request_id] = queue
+        self._stream_sent[request_id] = 0
+        return queue
+
+    def close_stream(self, request_id: str) -> None:
+        self._stream_queues.pop(request_id, None)
+        self._stream_sent.pop(request_id, None)
 
     def _apply_stop_strings(self, outputs) -> None:
         """Terminate sequences whose decoded text contains a stop string.
@@ -366,7 +474,21 @@ class LLMEngine:
     def stats_snapshot(self) -> Dict[str, object]:
         """Values backing the Prometheus surface (spec section 9.2)."""
         stats = self.scheduler.stats
-        return {
+        extra: Dict[str, object] = {}
+        if self.dual is not None:
+            # The measured acceptance rate, separate from the scheduler's sliding
+            # window: with a quantized draft this is a real quantity that operators
+            # need to watch, because a drop in it means speculation has started
+            # costing throughput rather than saving it.
+            extra["helios_qassd_alpha"] = self.runner.measured_acceptance
+            extra["helios_qassd_drafted_total"] = self.runner.spec_drafted
+            extra["helios_qassd_accepted_total"] = self.runner.spec_accepted
+            extra["helios_qassd_weight_overhead_ratio"] = self.dual.memory_overhead()[
+                "overhead_ratio"
+            ]
+        extra["helios_kv_quantized"] = int(self.config.quantize_kv)
+        extra["helios_kv_bytes_total"] = self.runner.kv_bytes
+        return {**extra, **{
             "helios_running_seqs": self.scheduler.num_running(),
             "helios_waiting_seqs": self.scheduler.num_waiting(),
             "helios_kv_blocks_used": self.allocator.committed_vram_blocks,
@@ -383,4 +505,4 @@ class LLMEngine:
             "helios_exec_faults_total": stats.exec_faults,
             "helios_scheduler_steps_total": stats.step,
             "helios_empty_steps_total": stats.empty_steps,
-        }
+        }}

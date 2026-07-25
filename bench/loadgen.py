@@ -516,7 +516,8 @@ def main() -> None:
     ap.add_argument(
         "--suite",
         default="ablations",
-        choices=["ablations", "baselines", "all", "quick", "prefill-heavy", "prefix-cache"],
+        choices=["ablations", "baselines", "all", "quick", "prefill-heavy",
+                 "prefix-cache", "kv-quant"],
     )
     ap.add_argument("--static-batch-size", type=int, default=8)
     args = ap.parse_args()
@@ -596,6 +597,34 @@ def main() -> None:
             run_helios(
                 args.model, shared, {"enable_prefix_cache": False},
                 name="helios_shared_prefix_cache_off",
+            )
+        )
+
+    if args.suite in ("kv-quant", "all"):
+        # The INT8 KV cache's whole claim is CONCURRENCY, not speed: the same byte
+        # budget holds ~2x the blocks, so more sequences stay resident and the
+        # batched-decode win (which scales with batch size) gets bigger.
+        #
+        # The pool must actually BIND, and getting that right took two attempts.
+        # At 4 MiB the toy model's cache holds 512 blocks -- far more than this
+        # workload needs -- so both configurations kept every sequence resident
+        # (mean decode batch 14.95 in both) and the ablation measured nothing but
+        # dequantization overhead: int8 came out 20% SLOWER. That is a real cost,
+        # but reporting it as "the INT8 KV cache is slower" would be measuring a
+        # mechanism outside the regime it exists for, which this project has
+        # already got wrong once (see BENCHMARKS.md on the prefix cache).
+        #
+        # 256 KiB is sized so the difference is structural: fp32 gets 32 blocks
+        # (512 tokens) and must preempt, int8 gets 113 (1808 tokens) and does not.
+        cramped = {"kv_cache_bytes": 256 * 1024, "max_num_seqs": 64}
+        print("[bench] running KV-quantization ablation (cramped pool) ...", flush=True)
+        results.append(
+            run_helios(args.model, spec, cramped, name="helios_kv_fp_cramped")
+        )
+        results.append(
+            run_helios(
+                args.model, spec, {**cramped, "quantize_kv": True},
+                name="helios_kv_int8_cramped",
             )
         )
 

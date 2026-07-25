@@ -45,6 +45,12 @@ could never be compiled, run, or benchmarked here.
 | Adaptive speculation gating | 7.3 | Built (batch size + measured acceptance) |
 | Deterministic simulation testing | 10 | Built. Seed sweeps, fault injection, replay |
 | **Serving a real pretrained model** | 8.1 | **Verified on T4: Qwen2.5-0.5B generates coherent text in fp16** |
+| **W4A16 INT4 weight quantization** | 8.2 | Built. Packed int4, group-wise scales, **3.8× vs fp16** measured |
+| **AWQ activation-aware scaling** | 8.2 | Built. **1.58× lower output error than RTN**, measured over 168 layers |
+| **INT8 quantized KV cache (the "KV shadow")** | 7.4 | Built. Per-token per-head scales, **1.94× vs fp16**, 3.4× more blocks |
+| **Quantization-asymmetric speculation (QASSD)** | 7.1 | Built. **α = 0.6548 measured** on Qwen2.5-0.5B — see below |
+| **KV transfer FSM (prefill→decode migration)** | 6.4 | Built. 7 states, 5 fault kinds, **DST-verified under injection** |
+| **Token-by-token SSE streaming** | 9.1 | Built. Incremental detokenization, reassembly asserted |
 | OpenAI-compatible HTTP API | 9.1 | Built (`/v1/completions`, `/v1/chat/completions`) |
 | Prometheus metrics | 9.2 | Built |
 | Benchmark harness + ablations | 11 | Built (Poisson arrivals, percentiles, goodput) |
@@ -55,33 +61,41 @@ could never be compiled, run, or benchmarked here.
 | Missing | Spec section | Why |
 |---|---|---|
 | **Rust frontend + scheduler** | 3, 4 | Cut by section 12.2. Everything is Python |
-| **W4A16 / AWQ / GPTQ quantization** | 8.2 | Needs GPU kernels to be meaningful |
-| **W4A4 draft path — the "QA" in QASSD** | 7.1 | Same. This is the core novelty claim and **it is not implemented** |
-| **Quantized KV shadow / dual-buffer** | 7.4 | Same |
-| **Prefill/decode disaggregation** | 6.4 | Needs ≥2 devices; there are none |
-| **KV transfer FSM across partitions** | 6.4 | Same. (Fault *kinds* are modelled in DST, the transport is not) |
-| **70B pipeline-parallel across 2 cards** | 8.1 | Same |
-| **vLLM baseline comparison** | 11 | vLLM requires CUDA; cannot be run here |
+| **A fused int4 GEMM** | 8.2 | The quantization is numerically real; the *speedup* is not. `QuantLinear` dequantizes then calls a normal GEMM, so on CPU it is **slower** than fp32. Every speedup from quantization in this repo is labelled **modelled** |
+| **W4A4 — 4-bit activations** | 7.1 | The T4 has no fast int4 activation path, so a W4A4 draft would not be cheaper than the verify and the premise fails. Hardware constraint, not a gap |
+| **Disaggregation across real devices** | 6.4 | The FSM, the block accounting, and the transfer/re-prefill decision are built and DST-verified. The *transport* is simulated — no second device to move bytes to |
+| **70B pipeline-parallel across 2 cards** | 8.1 | Needs the hardware |
+| **vLLM baseline comparison** | 11 | `bench/vllm_baseline.py` is **written with matched controls but has never been run** — vLLM requires CUDA. No comparison is claimed |
 | **gRPC surface, shm ring buffer IPC** | 3 | Cut by section 12.2; single process |
-| **Token-by-token SSE streaming** | 9.1 | Wire format is correct, but one frame per response |
 
-### The speculative decoding caveat, stated precisely
+### QASSD, stated precisely
 
-`helios/exec/runner.py` implements the full speculative *control flow*: draft γ
-tokens, verify in one parallel pass, accept the longest matching prefix, emit a
-bonus token, roll back rejected positions in the KV cache. Tests prove the
-output is **bit-identical** to non-speculative decoding for γ ∈ {1,2,4,8}.
+The quantization asymmetry **is** implemented now, and measured. `docs/QASSD.md`
+has the full result; the honest summary:
 
-But draft and verify read the **same fp32 weights**, because there is no
-quantized path. So:
+- **α = 0.6548** (336 drafted, 220 accepted) on Qwen2.5-0.5B with an int4 AWQ
+  draft against fp32 verify.
+- Spec section 14's **kill gate (α ≥ 0.6) passes.** Spec section 7.3's **target
+  (α ≥ 0.78) does not.**
+- Best γ is **2**, not the spec's 4. At γ=8 speculation is a net **loss** (0.94×).
+- Modelled speedup at best γ: **~1.4×**, or ~1.56× using measured tokens/pass.
+  **Modelled, not measured** — there is no int4 GEMM here (spec section 19.6).
+- It costs **+51% weight memory**, measured. Both precisions must be resident.
 
-- acceptance rate is 1.0 **by construction**, not by merit;
-- there is **no speedup** — it is strictly slower, since drafting is serial;
-- it says **nothing** about whether QASSD's α ≥ 0.78 target is achievable.
+The safety property is what makes this shippable and it is asserted, not argued:
+`test_asymmetric_speculation_matches_the_target_exactly` requires **identical
+token ids** with and without the quantized draft. Speculation is correct because
+the *verifier* decides, not because the draft is good — so a bad draft costs
+throughput and nothing else.
 
-What it does establish: the scheduler's accept/rollback bookkeeping and KV
-truncation are correct, which is the part most likely to silently corrupt
-output. The quantization asymmetry that would make it fast is future work.
+The symmetric mode (draft and verify at the same precision, α = 1.0 by
+construction) is retained as the correctness oracle: with no quantization noise,
+output must be bit-identical for γ ∈ {1,2,4,8}, so there is nothing for a
+bookkeeping bug to hide behind.
+
+For a 0.5B model this is a poor trade. Quantization error at fixed bit-width
+falls with model size, so a 7B model should do better — **that is a hypothesis,
+not a result, and it is not claimed.**
 
 ## End-to-end verification on real weights
 
@@ -168,6 +182,44 @@ It is not evidence about GPU throughput, quantized inference, or any comparison
 with another engine. Absolute tokens/second numbers are meaningless here — the
 model is a toy.
 
+## Disaggregation: what "built" means here
+
+Spec section 6.4 wants prefill and decode on separate devices with the prompt's KV
+cache transferred between them. There is one device, so the *transport* is
+simulated. Everything else is real and is the part where the bugs live:
+
+- **A 7-state FSM** (`core/disagg.py`) with an explicit legal-transition table.
+  The table is the specification — an FSM that tolerates an unlisted edge
+  specifies nothing — so an illegal transition raises rather than being absorbed.
+- **The SENT/RECEIVED distinction.** Collapsing them (which an async/await
+  formulation does by default) makes "sender finished, receiver never
+  acknowledged" *unrepresentable* and therefore untestable. That gap is where
+  every interesting fault lives.
+- **Five fault kinds**: receiver OOM, link timeout, checksum mismatch, lost ack,
+  mid-flight abort. Each returns blocks from **both** partitions, because handling
+  one side leaks the other — and a leak is invisible until the pool is exhausted,
+  which looks like a capacity problem rather than a bug.
+- **DST integration.** Half of all seeds run the FSM alongside the scheduler under
+  randomised faults, asserting FSM invariants D1–D6 plus two pool invariants the
+  FSM cannot check itself. Coverage measured across 200 seeds: every fault kind
+  reached, retry in 72 seeds, re-prefill fallback in 56.
+- **Detection verified, not just coverage.** Reintroducing the classic
+  partial-failure leak (`fail()` returning the sender's blocks but not the
+  receiver's) is caught by **31/60 seeds** with a diagnostic message naming the
+  exact accounting discrepancy. Making an abort legal after SENT is caught by
+  15/60. This distinction matters because a coverage gap was already mistaken for
+  a passing test once in this project — see the copy-on-write note in `DST.md`.
+- **The transfer-versus-re-prefill decision** computed from bandwidth rather than
+  assumed, because the answer flips with the hardware: for a 262 MB KV cache,
+  transferring wins by ~11× over PCIe 3.0 and *loses* over 10 GbE. A design that
+  always transferred would be strictly worse than no disaggregation at all on the
+  wrong side of that line.
+
+An error worth recording: the first version of that arithmetic put the KV at
+2.6 GB instead of 262 MB — a factor of ten — which inverted the PCIe verdict. It
+was caught by a test written against the real formula, not by review. An
+arithmetic slip in a comment is still a claim with no reproduction behind it.
+
 ## Defensible claims
 
 Adapting the wording spec section 12.2 pre-approved:
@@ -187,19 +239,38 @@ Adapting the wording spec section 12.2 pre-approved:
 > `docs/DST.md`. Verified correctness by bit-exact parity: chunked vs single-shot
 > prefill, speculative vs non-speculative decoding, and paged vs dense attention.
 
-Not defensible, and not claimed anywhere in this repo: beating vLLM,
-quantization-asymmetric speculation, heterogeneous multi-GPU serving,
-disaggregated prefill/decode.
+And what the quantization and speculation work adds:
 
-## If a GPU becomes available
+> Implemented W4A16 INT4 weight quantization with AWQ activation-aware channel
+> scaling (**1.58× lower per-layer output error than round-to-nearest**, measured
+> across 168 layers of Qwen2.5-0.5B) and an INT8 paged KV cache with per-token
+> scales (**1.94× smaller**, 3.4× more resident blocks at a fixed byte budget).
+> Used them to build quantization-asymmetric self-speculative decoding — drafting
+> from a 4-bit view of the target's own weights — and **measured the acceptance
+> rate the design depends on: α = 0.6548**. That cleared the pre-committed kill
+> threshold of 0.6 but missed the 0.78 design target, and showed the optimal draft
+> length is 2 rather than the planned 4, with γ=8 a net loss. Output is
+> **bit-identical** to non-speculative decoding, asserted by test, because the
+> verifier decides which tokens commit.
 
-Roughly the spec's own ordering, cheapest first:
+Not defensible, and not claimed anywhere in this repo: beating vLLM (never run),
+any *measured* speedup from quantization (no int4 GEMM — all such figures are
+labelled modelled), heterogeneous multi-GPU serving, disaggregated serving across
+real devices (the FSM is verified; the transport is simulated).
 
-1. Triton paged-attention kernel, validated against the existing gather+SDPA
-   path (which is already the correctness oracle a kernel needs).
-2. W4A16 AWQ loading + GEMM; re-run the ablation suite.
-3. W4A4 draft path + quantized KV shadow. **Measure α before building the rest**
-   — spec section 14 says kill the feature if α < 0.6.
-4. Two devices → partition roles and the KV transfer FSM. The FSM's fault
-   taxonomy already exists in the DST harness.
-5. vLLM baseline on identical hardware/model/quantization.
+## The remaining honest gaps, in dependency order
+
+1. **A fused int4 GEMM** (Triton, W4A16 dequant-in-epilogue). This is the single
+   thing standing between the α measurement and a real speedup claim. Everything
+   numerical is already verified against it as an oracle.
+2. **vLLM baseline.** `bench/vllm_baseline.py` is written with the controls matched
+   — same model dir, same dtype, same KV byte budget, same seeded arrival trace,
+   warm-up discarded — and has never been run. It is designed so that losing is a
+   reportable outcome.
+3. **α on a 7B model.** The 0.5B result is marginal; the hypothesis that it
+   improves with scale is untested.
+4. **Two devices** → real KV transport behind the existing FSM. The fault taxonomy
+   and block accounting are already there and already verified, so this is
+   plumbing rather than design.
+5. **Rust frontend.** Cut by section 12.2 and still cut. The ExecStep seam that
+   would make it possible is preserved, which was the point.

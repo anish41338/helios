@@ -2,10 +2,19 @@
 
 Spec section 8.2: load from safetensors with mmap, no full-model host copy.
 
-Only the fp32/fp16 path is implemented. AWQ/GPTQ int4 unpacking (W4A16) is out
-of scope for this build -- see docs/SCOPE.md. Quantized kernels need a GPU to be
-worth anything, and shipping a dequantize-to-fp32 stub would be a claim without
-a benchmark behind it.
+This loader reads fp32/fp16 checkpoints only. Four-bit quantization happens
+*after* loading, in exec/quant.py: `quantize_model` replaces the fp Linears in
+place. That split is deliberate rather than incidental --
+
+  * it works on any Llama/Qwen2 checkpoint, without needing a pre-quantized AWQ or
+    GPTQ artifact for each one;
+  * AWQ's channel scales are searched against activations captured from *this*
+    model on *this* calibration set, which is what makes the search meaningful;
+  * and it keeps the fp weights available, which QASSD requires -- it needs both
+    precisions resident (see exec/qassd.py).
+
+Loading a pre-quantized AWQ/GPTQ checkpoint directly is not implemented. It would
+be a packing-format adapter, not new numerics.
 """
 
 from __future__ import annotations

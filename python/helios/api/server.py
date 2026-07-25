@@ -135,15 +135,9 @@ class EngineRunner:
         prefix_cache: bool,
         request_id: Optional[str] = None,
     ):
-        request_id = request_id or f"cmpl-{uuid.uuid4().hex[:24]}"
-
-        try:
-            self.engine.add_request(
-                request_id, prompt_token_ids, params, slo_class, prefix_cache
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+        request_id = self._enqueue(
+            prompt_token_ids, params, slo_class, prefix_cache, request_id
+        )
         out = await self._pump_until(request_id)
         if out is None:
             raise HTTPException(
@@ -151,6 +145,69 @@ class EngineRunner:
                 detail=f"request {request_id} did not complete within the step budget",
             )
         return request_id, out
+
+    def _enqueue(
+        self,
+        prompt_token_ids: List[int],
+        params: SamplingParams,
+        slo_class: SloClass,
+        prefix_cache: bool,
+        request_id: Optional[str] = None,
+    ) -> str:
+        request_id = request_id or f"cmpl-{uuid.uuid4().hex[:24]}"
+        try:
+            self.engine.add_request(
+                request_id, prompt_token_ids, params, slo_class, prefix_cache
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return request_id
+
+    async def stream(
+        self,
+        prompt_token_ids: List[int],
+        params: SamplingParams,
+        slo_class: SloClass,
+        prefix_cache: bool,
+    ):
+        """Yield (request_id, delta_text, final_output) as tokens are produced.
+
+        `final_output` is None until the request finishes, then carries the
+        CompletionOutput on a last yield with an empty delta.
+
+        Same cooperative-pump discipline as `submit`: this coroutine steps the
+        engine itself while holding the lock, drains its own deltas, and yields
+        between steps. Deltas for *other* streaming requests accumulate in their
+        own queues and are picked up when those handlers next run -- so one slow
+        SSE client cannot stall the engine, and a fast one cannot starve the rest.
+        """
+        request_id = self._enqueue(prompt_token_ids, params, slo_class, prefix_cache)
+        queue = self.engine.open_stream(request_id)
+        try:
+            for _ in range(self.step_budget):
+                while queue:
+                    yield request_id, queue.pop(0), None
+
+                if request_id in self._results:
+                    break
+
+                async with self._lock:
+                    if request_id in self._results or not self.engine.scheduler.has_work:
+                        pass
+                    else:
+                        for out in self.engine.step():
+                            self._results[out.request_id] = out
+                await asyncio.sleep(0)
+
+                if request_id in self._results and not queue:
+                    break
+
+            # Anything the last step produced, before the terminal frame.
+            while queue:
+                yield request_id, queue.pop(0), None
+            yield request_id, "", self._results.pop(request_id, None)
+        finally:
+            self.engine.close_stream(request_id)
 
 
 def _parse_stop(stop) -> List[str]:
@@ -384,44 +441,108 @@ def _apply_chat_template(engine: LLMEngine, messages: List[ChatMessage]) -> str:
 
 
 async def _stream_completion(runner, token_ids, params, slo, req):
-    """SSE stream. Emits the completion once, then [DONE].
+    """Incremental SSE stream: one frame per decoded text delta, then [DONE].
 
-    Token-by-token streaming needs a per-token callback from the engine; this
-    build resolves a request when it finishes, so the stream carries one data
-    frame. The wire format is correct for OpenAI clients either way.
+    A frame carries a *text* delta rather than a token, because a token is not a
+    character -- a multi-byte codepoint spans several BPE tokens, and emitting
+    them individually would put invalid UTF-8 on the wire. The engine's
+    incremental detokenizer only releases characters once complete, so a frame is
+    sometimes empty for a token and sometimes several characters for one; those
+    are skipped rather than sent as empty frames.
+
+    Speculative decoding makes this visibly non-uniform: a verify pass can commit
+    several tokens at once, so one step can produce a multi-character delta. That
+    is correct, not a bug -- the alternative would be to hold tokens back and
+    hand-feed them, which adds latency for cosmetic smoothness.
     """
-    request_id, out = await runner.submit(token_ids, params, slo, req.helios.prefix_cache)
-    chunk = {
+    created = int(time.time())
+    final = None
+    request_id = None
+    async for rid, delta, out in runner.stream(
+        token_ids, params, slo, req.helios.prefix_cache
+    ):
+        request_id = rid
+        if out is not None:
+            final = out
+            break
+        if not delta:
+            continue
+        yield "data: " + json.dumps({
+            "id": rid,
+            "object": "text_completion",
+            "created": created,
+            "model": req.model,
+            "choices": [{"index": 0, "text": delta, "finish_reason": None}],
+        }) + "\n\n"
+
+    # Terminal frame carries the finish reason and no text, matching OpenAI.
+    yield "data: " + json.dumps({
         "id": request_id,
         "object": "text_completion",
-        "created": int(time.time()),
+        "created": created,
         "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "text": out.text,
-                "finish_reason": out.finish_reason.value if out.finish_reason else None,
-            }
-        ],
-    }
-    yield f"data: {json.dumps(chunk)}\n\n"
+        "choices": [{
+            "index": 0,
+            "text": "",
+            "finish_reason": (
+                final.finish_reason.value if final and final.finish_reason else "stop"
+            ),
+        }],
+    }) + "\n\n"
     yield "data: [DONE]\n\n"
 
 
 async def _stream_chat(runner, token_ids, params, slo, req):
-    request_id, out = await runner.submit(token_ids, params, slo, req.helios.prefix_cache)
-    chunk = {
-        "id": request_id.replace("cmpl", "chatcmpl"),
+    """Incremental SSE stream in the chat.completion.chunk shape.
+
+    The role appears once, in an otherwise-empty first delta, then content
+    deltas follow. That is what the OpenAI protocol specifies and what clients
+    that build a message object incrementally expect.
+    """
+    created = int(time.time())
+    final = None
+    request_id = None
+    first = True
+    async for rid, delta, out in runner.stream(
+        token_ids, params, slo, req.helios.prefix_cache
+    ):
+        request_id = rid
+        chat_id = rid.replace("cmpl", "chatcmpl")
+        if out is not None:
+            final = out
+            break
+        if not delta:
+            continue
+        if first:
+            yield "data: " + json.dumps({
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"},
+                             "finish_reason": None}],
+            }) + "\n\n"
+            first = False
+        yield "data: " + json.dumps({
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": req.model,
+            "choices": [{"index": 0, "delta": {"content": delta},
+                         "finish_reason": None}],
+        }) + "\n\n"
+
+    yield "data: " + json.dumps({
+        "id": (request_id or "").replace("cmpl", "chatcmpl"),
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant", "content": out.text},
-                "finish_reason": out.finish_reason.value if out.finish_reason else None,
-            }
-        ],
-    }
-    yield f"data: {json.dumps(chunk)}\n\n"
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": (
+                final.finish_reason.value if final and final.finish_reason else "stop"
+            ),
+        }],
+    }) + "\n\n"
     yield "data: [DONE]\n\n"

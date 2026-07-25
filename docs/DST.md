@@ -56,12 +56,60 @@ structural invariants added as bugs demanded them:
 The liveness and leak checks matter as much as the invariants: most bugs below
 were livelocks, not corruption.
 
+### The KV transfer FSM (spec section 6.4)
+
+Half of all seeds also drive the prefill→decode KV migration state machine
+(`core/disagg.py`) alongside the scheduler, under the same discipline: step-driven,
+seeded faults, invariants after every step. It runs on a separate RNG stream
+(`seed ^ 0xD15A`) so that adding it could not perturb any previously-verified
+seed's scheduler workload.
+
+Six FSM invariants:
+
+- D1 block-list lengths agree with `n_blocks`
+- D2 a reserved transfer holds exactly `n_blocks` destination blocks
+- D3 no physical destination block is claimed by two live transfers
+- D4 `bytes_sent ≤ bytes_total`
+- D5 an in-flight transfer has a start step — **without one it can never time
+  out**, which is a hang rather than a crash
+- D6 in-flight count never exceeds the configured link concurrency
+
+Plus two *pool* invariants the FSM cannot check itself, because it does not own
+the receiver's block pool:
+
+- P1 `free + reserved + landed == total`, every step. A reserved-but-forgotten
+  block breaks this immediately, which is the whole point — a leak is otherwise
+  invisible until the pool is exhausted, at which point it looks like a capacity
+  problem rather than a bug.
+- P2 at quiescence every block is free or held by a committed sequence; nothing is
+  in limbo. Enforced by draining the FSM to completion with no new submissions,
+  which also catches a transfer that can never be resolved.
+
+**Coverage measured across 200 seeds** (100 of which ran disaggregation): every
+fault kind reached — abort 80, link timeout 41, checksum mismatch 30, receiver OOM
+22 — with retry in 72 seeds and re-prefill fallback in 56.
+
+**Detection verified, not just coverage.** Applying the lesson from the
+copy-on-write section below, two bugs were deliberately reintroduced:
+
+| Injected bug | Caught by | First failure |
+|---|---|---|
+| `fail()` returns the sender's blocks but not the receiver's | **31/60 seeds** | `P1: receiver blocks do not add up: free=4 + reserved=0 + landed=2 = 6, expected 14` |
+| a client abort is allowed to cancel a transfer already at `SENT` | **15/60 seeds** | `illegal transfer transition sent -> aborted for transfer 53 (legal: ['received', 'failed'])` |
+
+The first is the classic partial-failure leak. The second is why the transition
+table is written out explicitly rather than implied by control flow: an
+async/await formulation collapses `SENT` and `RECEIVED`, which makes "sender
+finished, receiver never acknowledged" unrepresentable and therefore untestable.
+
 ## Result
 
 ```
 50,000 seeds — 0 failures   (3,807 s single-threaded)
-20,000 seeds — 0 failures   (re-verified on the current commit, after the
-                             executor was rewritten to batch decode/prefill)
+20,000 seeds — 0 failures   (re-verified after the executor was rewritten to
+                             batch decode/prefill)
+ 5,000 seeds — 0 failures   (re-verified after the KV transfer FSM was added,
+                             commit 274fa7a; ~2,500 of them exercised it)
 ```
 
 The 20,000-seed run's artifact records the commit it measured
@@ -77,8 +125,10 @@ python -m helios.cli vopr --seeds 50000 --progress-every 10000 \n    --json-out 
 ```
 
 Artifacts: `artifacts/dst_20k_final.json` (20,000 seeds, commit-stamped),
-`artifacts/dst_50k.log` + `.json` (50,000 seeds), and `artifacts/dst_20k.log`
-(an earlier run, before the copy-on-write fork coverage existed).
+`artifacts/dst_50k.log` + `.json` (50,000 seeds), `artifacts/dst_5k_disagg.json`
+(re-verified after the KV transfer FSM was added to the harness), and
+`artifacts/dst_20k.log` (an earlier run, before the copy-on-write fork coverage
+existed).
 
 ## Bugs found
 

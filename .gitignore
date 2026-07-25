@@ -22,3 +22,14 @@ artifacts/**/*.safetensors
 # claim to trace to an artifact, and docs/DST.md cites them.
 artifacts/helios_*.json
 artifacts/baseline_*.json
+
+# Chart PNGs are build outputs of bench/make_report.py and are embedded in the
+# committed PDF, so tracking them would store the same pixels twice.
+artifacts/figures/
+
+# The alpha measurements are NOT ignored, for the same reason as the DST logs:
+# docs/QASSD.md and the PDF report both cite specific numbers from them, and
+# reproducing them costs ~9 minutes plus a 1 GB checkpoint download.
+!artifacts/alpha.json
+!artifacts/alpha_rtn.json
+!artifacts/alpha_significance.json

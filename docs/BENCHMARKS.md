@@ -46,6 +46,8 @@ Each row differs from `full` by one mechanism, which is what makes the delta att
 |---|---|---|---|---|---|---|---|---|
 | `batch1` | 24/24 | 161.5 | 1.8838 | 3.3041 | 0.0064 | 0.0077 | 2.2301 | 0.38 |
 | `full` | 24/24 | 409.4 | 0.3600 | 0.3601 | 0.0341 | 0.0426 | 1.0600 | 0.88 |
+| `kv_fp_cramped` | 16/16 | 73.8 | 2.2014 | 4.6475 | 0.0613 | 0.1209 | 4.4743 | 0.25 |
+| `kv_int8_cramped` | 16/16 | 54.0 | 1.3560 | 1.3561 | 0.2192 | 0.2564 | 6.3502 | 0.25 |
 | `no_chunked_prefill` | 24/24 | 439.5 | 0.3160 | 0.3161 | 0.0313 | 0.0359 | 0.9608 | 0.88 |
 | `no_prefix_cache` | 24/24 | 443.3 | 0.3163 | 0.3164 | 0.0292 | 0.0320 | 0.9293 | 0.88 |
 | `prefill_heavy` | 32/32 | 90.2 | 0.9561 | 1.1549 | 0.1536 | 0.3427 | 1.2636 | 0.28 |
@@ -129,6 +131,8 @@ Each row differs from `full` by one mechanism, which is what makes the delta att
 - `artifacts/baseline_unbatched_prefill_seed0.json` -> `baseline_unbatched_prefill`
 - `artifacts/helios_batch1_seed0.json` -> `helios_batch1`
 - `artifacts/helios_full_seed0.json` -> `helios_full`
+- `artifacts/helios_kv_fp_cramped_seed0.json` -> `helios_kv_fp_cramped`
+- `artifacts/helios_kv_int8_cramped_seed0.json` -> `helios_kv_int8_cramped`
 - `artifacts/helios_no_chunked_prefill_seed0.json` -> `helios_no_chunked_prefill`
 - `artifacts/helios_no_prefix_cache_seed0.json` -> `helios_no_prefix_cache`
 - `artifacts/helios_prefill_heavy_seed7.json` -> `helios_prefill_heavy`

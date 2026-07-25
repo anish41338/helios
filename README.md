@@ -2,16 +2,26 @@
 
 An LLM serving engine built from scratch in Python: paged attention, a
 copy-on-write paged KV allocator, iteration-level continuous batching, chunked
-prefill, a radix-trie prefix cache, an OpenAI-compatible HTTP API — and a
-deterministic simulation testing harness that found **15 real bugs** in the
-scheduler.
+prefill, a radix-trie prefix cache, INT4 weight quantization with AWQ, an INT8
+paged KV cache, quantization-asymmetric speculative decoding, a fused Triton
+kernel, an OpenAI-compatible streaming HTTP API — and a deterministic simulation
+testing harness that found **15 real bugs** in the scheduler.
 
-Implements the "minimal defensible v1" scope of [HELIOS-SPEC.md](HELIOS-SPEC.md)
-(spec §12.2). **Read [docs/SCOPE.md](docs/SCOPE.md) before making any claim about
-this project** — it states exactly what is built and what is not. Short version:
-no CUDA/Triton kernels, no quantization, no prefill/decode disaggregation, no
-vLLM comparison. The machine this was built on has no NVIDIA GPU, and spec §19.5
-says cut scope rather than ship something unverified.
+**Read [docs/SCOPE.md](docs/SCOPE.md) before making any claim about this
+project** — it states exactly what is built and what is not. Short version of
+what is *not*: no fused int4 GEMM (so every quantization speedup here is
+**modelled**, not measured), no vLLM comparison (written, never run), no real
+multi-device disaggregation (the transfer FSM is verified, the transport is
+simulated), no Rust.
+
+The headline result, because it is the one that decides a design question rather
+than reporting a speedup:
+
+> **α = 0.6548** — the measured rate at which a 4-bit draft of the model's own
+> weights agrees with the full-precision verifier on Qwen2.5-0.5B. The spec's
+> pre-committed kill threshold was 0.6, so the feature survives; its *target* was
+> 0.78, so it misses. Optimal draft length is **2**, not the planned 4, and at
+> γ=8 speculation becomes a net **loss**. See [docs/QASSD.md](docs/QASSD.md).
 
 ## Quick start
 
@@ -34,12 +44,24 @@ curl localhost:8000/v1/completions \
     -H 'content-type: application/json' \
     -d '{"prompt":"hello","max_tokens":16}'
 
+# INT8 KV cache: ~2x smaller, so ~2x the resident sequences
+PYTHONPATH=python python -m helios.cli generate \
+    --model /tmp/toy --prompt "hello" --quantize-kv
+
+# QASSD: draft from a 4-bit view of the same weights
+PYTHONPATH=python python -m helios.cli generate \
+    --model /tmp/toy --prompt "hello" --spec-decode --quantized-draft
+
 # the simulation harness
 PYTHONPATH=python python -m helios.cli vopr --seeds 1000
+
+# measure the acceptance rate the QASSD design depends on
+python bench/measure_alpha.py --model artifacts/qwen05b --gamma 4
 ```
 
 With a real model, point `--model` at any Llama-3.x or Qwen2.5 HuggingFace
-directory (fp32/fp16 safetensors; no AWQ/GPTQ support — see SCOPE).
+directory (fp32/fp16 safetensors; quantization is applied in-process rather than
+loaded from a pre-quantized AWQ/GPTQ checkpoint).
 
 ## Why the DST harness is the interesting part
 
@@ -118,10 +140,22 @@ tolerance is never loosened to make a test pass):
 | Triton kernel vs PyTorch paged path | matches within fp16 tolerance on a T4, order-invariant |
 | Loader vs unmapped checkpoint tensors | refuses to load rather than drop weights |
 | Allocator I1–I7 | asserted after every op, 40 randomized walks |
+| **QASSD vs unspeculated decode** | **identical token ids** — the int4 draft cannot change output |
+| INT4 pack/unpack | exactly invertible; error within half a quantization step |
+| AWQ vs RTN | AWQ's output error never worse, and lower with salient channels |
+| INT8 KV round-trip | within `s/2 + \|q\|·\|s − fp16(s)\|`, both terms derived |
+| KV transfer FSM | every illegal transition raises; both partitions' blocks reclaimed on failure |
+| Streamed vs non-streamed text | concatenated deltas reproduce the whole answer exactly |
 
 ```bash
 PYTHONPATH=python python -m pytest tests -q
 ```
+
+The QASSD row is the one to read twice. Speculation is correct **not because the
+draft is good** but because the verifier decides which tokens commit — so a
+degraded 4-bit draft costs throughput and nothing else. That property is what
+makes it safe to ship a draft whose quality you have not characterised, and it is
+asserted by test rather than argued in a comment.
 
 ## Benchmarks
 
@@ -174,21 +208,33 @@ python/helios/
     allocator.py     paged blocks, ref counts, CoW, I1-I7        (spec §5)
     scheduler.py     continuous batching, admission, preemption   (spec §6)
     prefix_cache.py  radix trie, block-aligned, LRU eviction      (spec §3)
+    disagg.py        KV transfer FSM, 7 states, 5 fault kinds     (spec §6.4)
     vopr.py          the DST harness                              (spec §10)
     types.py         requests, sequences, SLO classes             (spec §6.2)
     execstep.py      the scheduler<->executor contract            (spec §10.1)
   exec/          PyTorch execution
     model.py         Llama/Qwen2: GQA, RoPE, SwiGLU, RMSNorm      (spec §8.1)
-    paged_attn.py    attention over a block table                 (spec §8.3)
+    paged_attn.py    attention over a block table; INT8 KV cache  (spec §8.3, §7.4)
+    triton_attn.py   fused paged decode kernel, 5.26x on a T4     (spec §8.3)
+    quant.py         INT4 packing, group scales, AWQ search       (spec §8.2)
+    qassd.py         int4 draft / fp verify, the alpha model      (spec §7)
     loader.py        safetensors loading                          (spec §8.2)
     runner.py        ExecStep -> forward pass; speculation        (spec §7.2)
     sampler.py       greedy, temperature, top-k, top-p
-  api/server.py  OpenAI-compatible HTTP + Prometheus              (spec §9)
+  api/server.py  OpenAI-compatible HTTP, incremental SSE, metrics (spec §9)
   engine.py      scheduler + executor + metrics
   cli.py         serve / generate / vopr / info / make-toy-model
-bench/           load generator, baselines, report generator      (spec §11)
-tests/           allocator, scheduler, parity, e2e
-docs/            SCOPE.md, DST.md, ARCHITECTURE.md, BENCHMARKS.md
+bench/           load generator, baselines, alpha measurement,    (spec §11)
+                 significance analysis, PDF report generator
+tests/           allocator, scheduler, quant, disagg, parity, e2e
+docs/            SCOPE.md, DST.md, QASSD.md, GPU.md, ARCHITECTURE.md,
+                 BENCHMARKS.md (generated), HELIOS-REPORT.pdf (generated)
+```
+
+A typeset engineering report is generated from the same artifacts the docs use:
+
+```bash
+python bench/make_report.py --out docs/HELIOS-REPORT.pdf
 ```
 
 ## Design notes
@@ -207,13 +253,25 @@ clock or RNG import.
 **Why decode and prefill contend.** Prefill is compute-bound (many query tokens
 amortise each weight read); decode is memory-bandwidth-bound (one query token
 attends over the whole context with almost no reuse). Interleaved on one device
-they fight, which is what chunked prefill mitigates and what the spec's
-disaggregation would have solved properly.
+they fight. Chunked prefill *bounds* that contention; disaggregation removes it,
+which is why [core/disagg.py](python/helios/core/disagg.py) exists — and why the
+decision of whether to transfer the KV or just recompute it is computed from
+bandwidth rather than assumed. For a 262 MB KV cache, transferring wins by ~11×
+over PCIe 3.0 and *loses* over 10 GbE. The crossover is at the machine boundary.
 
 **Why speculation must be bit-identical.** Speculation that changes output is a
-bug, not a speedup (spec §7.2). Note the honest caveat in SCOPE.md: draft and
-verify share the same fp32 weights here, so acceptance is 1.0 by construction
-and there is no speedup — the test proves the *bookkeeping*, not the idea.
+bug, not a speedup (spec §7.2). This holds for a reason worth stating: the
+*verifier* decides which tokens commit, so the emitted sequence is the target
+model's, whatever the draft proposes. That is what makes it safe to draft from a
+4-bit approximation whose quality you have measured but not controlled.
+
+**Why the kill threshold was written down first.** The 0.60 acceptance floor was
+fixed before any of the quantization work existed. The measurement came in at
+0.655 — close enough that a threshold picked afterwards would have been
+indefensible in either direction. Because it was pre-committed, the result is a
+decision rather than a rationalisation: the feature ships, its optimal γ is 2 and
+not the planned 4, and its expected benefit is bounded by a number instead of by
+hope.
 
 ## License
 

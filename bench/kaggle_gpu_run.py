@@ -238,8 +238,44 @@ def main() -> int:
         for suite in ("all", "prefill-heavy", "prefix-cache"):
             run([sys.executable, "bench/loadgen.py", "--model", str(bench_model),
                  "--suite", suite, "--requests", "32", "--out", "artifacts"])
+        # The KV-quantization suite needs its own request count: the pool has to
+        # bind for the concurrency win to exist at all, and 32 requests in the
+        # default pool does not bind (see the note in loadgen.py).
+        run([sys.executable, "bench/loadgen.py", "--model", str(bench_model),
+             "--suite", "kv-quant", "--requests", "16", "--prompt-len", "64",
+             "--output-len", "24", "--out", "artifacts"])
         run([sys.executable, "bench/report.py"])
         record["benchmarks_ran"] = True
+
+    banner("6. THE OPEN QUESTION THIS DEVICE CAN ANSWER")
+    print(
+        "  alpha for quantization-asymmetric speculation was already measured on\n"
+        "  CPU (0.6548, docs/QASSD.md) because it is a property of two weight\n"
+        "  matrices, not of hardware. What a GPU adds:\n"
+        "\n"
+        "    a) does halving the KV cache pay for its dequantization when\n"
+        "       bandwidth IS the bottleneck? Compare helios_kv_int8_cramped\n"
+        "       against helios_kv_fp_cramped in the artifacts just written --\n"
+        "       on CPU int8 was 27% SLOWER despite 2.31x more resident sequences.\n"
+        "\n"
+        "    b) alpha on a larger model. The 0.5B result clears the 0.6 gate but\n"
+        "       misses the 0.78 target; quantization error falls with model size,\n"
+        "       so a 7B model should do better. Untested. To run it here:\n"
+        "\n"
+        "         python bench/measure_alpha.py --model <7b-dir> --device cuda\n"
+        "\n"
+        "  Neither is claimed anywhere until it is measured (spec section 19.3)."
+    )
+    if local and (local / "config.json").exists():
+        rc, out = run([
+            sys.executable, "bench/measure_alpha.py", "--model", str(local),
+            "--device", "cuda", "--gamma", "4", "--max-new-tokens", "32",
+            "--out", "artifacts/alpha_gpu.json",
+        ])
+        record["alpha_gpu_ran"] = rc == 0
+        for line in out.splitlines():
+            if "ALPHA" in line or "GATE" in line:
+                record.setdefault("alpha_gpu_lines", []).append(line.strip())
 
     out_path = ROOT / "artifacts" / "gpu_run.json"
     out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")

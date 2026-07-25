@@ -105,6 +105,21 @@ def test_helios_extension_block_is_accepted(client):
     assert r.status_code == 200
 
 
+def _sse_frames(text):
+    """Parse an SSE body into decoded JSON payloads, excluding the [DONE] marker."""
+    import json
+
+    out = []
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        body = line[len("data: "):].strip()
+        if body == "[DONE]":
+            continue
+        out.append(json.loads(body))
+    return out
+
+
 def test_streaming_returns_sse_frames(client):
     r = client.post(
         "/v1/completions", json={"prompt": "hi", "max_tokens": 3, "stream": True}
@@ -112,6 +127,109 @@ def test_streaming_returns_sse_frames(client):
     assert r.status_code == 200
     assert "data: " in r.text
     assert "[DONE]" in r.text
+    assert r.headers["content-type"].startswith("text/event-stream")
+
+
+def test_streaming_emits_more_than_one_content_frame(client):
+    """Incremental streaming, not one frame with the whole answer.
+
+    This is the property the previous build did not have: the wire format was
+    correct but every response arrived as a single frame, so a client saw nothing
+    until the request finished. `> 1` rather than `== max_tokens` because a text
+    delta is not a token -- a step can produce no printable characters, and
+    speculative decoding can commit several tokens at once.
+    """
+    r = client.post(
+        "/v1/completions",
+        json={"prompt": "streaming test", "max_tokens": 16, "stream": True},
+    )
+    assert r.status_code == 200
+    frames = _sse_frames(r.text)
+    content = [f for f in frames if f["choices"][0]["text"]]
+    assert len(content) > 1, f"only {len(content)} content frames: {r.text[:400]}"
+
+
+def test_streamed_text_reassembles_to_the_non_streamed_answer(client):
+    """The correctness property: streaming must not change the output.
+
+    Concatenating the deltas must reproduce exactly what the non-streaming
+    endpoint returns for the same greedy request. An incremental detokenizer that
+    drops or duplicates a character would pass every other test here.
+    """
+    payload = {"prompt": "reassembly check", "max_tokens": 12, "temperature": 0.0}
+    whole = client.post("/v1/completions", json=payload).json()["choices"][0]["text"]
+
+    r = client.post("/v1/completions", json={**payload, "stream": True})
+    streamed = "".join(f["choices"][0]["text"] for f in _sse_frames(r.text))
+    assert streamed == whole
+
+
+def test_stream_terminates_with_a_finish_reason(client):
+    """OpenAI clients read the finish reason off the last frame before [DONE]."""
+    r = client.post(
+        "/v1/completions", json={"prompt": "hi", "max_tokens": 4, "stream": True}
+    )
+    frames = _sse_frames(r.text)
+    assert frames[-1]["choices"][0]["finish_reason"] is not None
+    assert frames[-1]["choices"][0]["text"] == ""
+    assert r.text.rstrip().endswith("data: [DONE]")
+
+
+def test_chat_stream_sends_the_role_once_then_content(client):
+    """The chat.completion.chunk protocol: role in the first delta, then content."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello there"}],
+            "max_tokens": 12,
+            "stream": True,
+        },
+    )
+    assert r.status_code == 200
+    frames = _sse_frames(r.text)
+    assert all(f["object"] == "chat.completion.chunk" for f in frames)
+
+    roles = [f for f in frames if "role" in f["choices"][0]["delta"]]
+    assert len(roles) == 1, "the role must appear exactly once"
+    assert roles[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert frames.index(roles[0]) == 0, "the role frame must come first"
+
+    content = [f for f in frames if f["choices"][0]["delta"].get("content")]
+    assert len(content) > 1
+    assert frames[-1]["choices"][0]["finish_reason"] is not None
+
+
+def test_chat_stream_reassembles_to_the_non_streamed_message(client):
+    payload = {
+        "messages": [{"role": "user", "content": "chat reassembly"}],
+        "max_tokens": 12,
+        "temperature": 0.0,
+    }
+    whole = client.post("/v1/chat/completions", json=payload).json()
+    expected = whole["choices"][0]["message"]["content"]
+
+    r = client.post("/v1/chat/completions", json={**payload, "stream": True})
+    streamed = "".join(
+        f["choices"][0]["delta"].get("content", "") for f in _sse_frames(r.text)
+    )
+    assert streamed == expected
+
+
+def test_streaming_does_not_leak_queues(client):
+    """A disconnected or finished stream must deregister itself.
+
+    Otherwise every streamed request permanently adds work to each engine step:
+    a slow leak that shows up as gradual throughput decay, which is far harder to
+    attribute than a crash.
+    """
+    engine = client.app.state.engine
+    for i in range(3):
+        client.post(
+            "/v1/completions",
+            json={"prompt": f"leak check {i}", "max_tokens": 4, "stream": True},
+        )
+    assert engine._stream_queues == {}
+    assert engine._stream_sent == {}
 
 
 def test_greedy_requests_are_reproducible(client):

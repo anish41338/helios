@@ -11,7 +11,7 @@ than the transport.
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -23,8 +23,11 @@ from ..core.execstep import (
     SeqOutput,
 )
 from .model import BatchedAttnMeta, HeliosModel
-from .paged_attn import PagedKVCache
+from .paged_attn import PagedKVCache, QuantizedPagedKVCache
 from .sampler import Sampler, greedy_token
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .qassd import DualPrecisionModel
 
 
 class ModelRunner:
@@ -37,18 +40,28 @@ class ModelRunner:
         block_size: int,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
+        kv_quant: bool = False,
+        dual: Optional["DualPrecisionModel"] = None,
     ) -> None:
         self.model = model
         self.config = model.config
         self.block_size = block_size
         self.device = device
         self.sampler = Sampler()
+        self.kv_quant = kv_quant
 
+        # QASSD: when present, `dual.draft` is an int4 view of the same weights
+        # and speculation drafts from it instead of from the target. Optional
+        # because the asymmetry costs +25% weight memory and is only worth paying
+        # when speculation is enabled (spec section 7).
+        self.dual = dual
+
+        cache_cls = QuantizedPagedKVCache if kv_quant else PagedKVCache
         # One cache per layer. Allocated up front so that a block id from the
         # scheduler is always backed by real storage -- the allocator's job is
         # to never hand out an id outside this range.
         self.kv_caches: List[PagedKVCache] = [
-            PagedKVCache(
+            cache_cls(
                 num_blocks=num_blocks,
                 block_size=block_size,
                 n_kv_heads=self.config.num_key_value_heads,
@@ -59,9 +72,31 @@ class ModelRunner:
             for _ in range(self.config.num_hidden_layers)
         ]
 
+        # The draft model needs its own KV: its keys and values come from int4
+        # weights, so they are numerically not the target's and cannot share
+        # storage. This is spec section 7.4's "quantized KV shadow", and it is
+        # quantized for the same reason the spec wanted it to be -- a second
+        # full-precision cache would halve the concurrency the engine just paid
+        # for.
+        self.draft_kv_caches: Optional[List[PagedKVCache]] = None
+        if dual is not None:
+            self.draft_kv_caches = [
+                QuantizedPagedKVCache(
+                    num_blocks=num_blocks,
+                    block_size=block_size,
+                    n_kv_heads=self.config.num_key_value_heads,
+                    head_dim=self.config.head_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+                for _ in range(self.config.num_hidden_layers)
+            ]
+
         self.steps_run = 0
         self.total_prefill_tokens = 0
         self.total_decode_tokens = 0
+        self.spec_drafted = 0
+        self.spec_accepted = 0
 
     @property
     def kv_bytes(self) -> int:
@@ -266,30 +301,39 @@ class ModelRunner:
     def _run_speculative(self, item, gamma: int) -> SeqOutput:
         """Self-speculative decode: draft gamma tokens, verify in one pass.
 
-        This is the *structure* of QASSD (spec section 7) without the
-        quantization asymmetry: draft and verify read the same fp32 weights, so
-        acceptance is 100% by construction and there is no speedup. It exists
-        to prove the accept/rollback bookkeeping and the KV truncation are
-        correct, which is the part the scheduler interacts with. The
-        quantization-asymmetric version needs W4A4/W4A16 kernels -- see
-        docs/SCOPE.md.
+        Two modes, selected by whether a DualPrecisionModel was supplied:
 
-        Because draft and verify are numerically identical here, this path is
-        also the strongest available check that speculation does not change
-        outputs: any divergence from the non-speculative path is a bug in the
-        bookkeeping, not a quantization artefact.
+        * **symmetric** (no dual): draft and verify read the same weights, so
+          acceptance is 1.0 by construction and there is no speedup. This mode
+          exists as a correctness oracle -- any divergence from non-speculative
+          decoding is a bookkeeping bug, not a quantization artefact, which is
+          what `test_speculative_matches_nonspeculative` relies on.
+
+        * **quantization-asymmetric** (with dual): drafts from an int4 view of
+          the same weights into a separate quantized KV shadow, verifies in fp.
+          This is QASSD proper (spec section 7). Acceptance is then a real
+          measurement, tracked in `spec_drafted`/`spec_accepted`.
+
+        In both modes the committed output is drawn from the *verified*
+        distribution, so the asymmetric mode cannot change what the engine emits
+        relative to the target model -- only how fast it gets there. That is the
+        invariant `test_qassd_output_matches_target` pins.
         """
+        asymmetric = self.dual is not None
+        draft_model = self.dual.draft if asymmetric else self.model
+        draft_kv = self.draft_kv_caches if asymmetric else self.kv_caches
+
         drafted: List[int] = []
         cur_token = item.last_token_id
         cur_pos = item.position
         ctx = item.context_len
 
-        # DRAFT: gamma sequential cheap forward passes.
+        # DRAFT: gamma sequential forward passes through the cheap model.
         for _ in range(gamma):
-            logits = self.model.forward(
+            logits = draft_model.forward(
                 token_ids=[cur_token],
                 positions=[cur_pos],
-                kv_caches=self.kv_caches,
+                kv_caches=draft_kv,
                 block_ids=item.block_ids,
                 is_decode=True,
                 context_len=ctx,
@@ -334,12 +378,43 @@ class ModelRunner:
             committed = accepted
 
         self.total_decode_tokens += len(committed)
+        self.spec_drafted += len(drafted)
+        self.spec_accepted += len(accepted)
+
+        # Re-sync the draft's KV over the committed tokens.
+        #
+        # The draft ran ahead and wrote keys for every token it proposed. Past
+        # the first rejection those keys describe a continuation that was thrown
+        # away, so the draft's next step would attend over a context the engine
+        # never committed to -- silently, since paged storage has no notion of
+        # truncation and the positions are simply overwritten later. Recomputing
+        # the committed span through the draft is what keeps the two models
+        # looking at the same prefix.
+        #
+        # Only needed in asymmetric mode: when draft and verify are the same
+        # model the verify pass has already written the correct KV.
+        if asymmetric and committed:
+            resync_tokens = [item.last_token_id] + committed[:-1]
+            draft_model.forward(
+                token_ids=resync_tokens,
+                positions=list(range(item.position, item.position + len(resync_tokens))),
+                kv_caches=draft_kv,
+                block_ids=item.block_ids,
+                is_decode=False,
+                context_len=item.position + len(resync_tokens),
+            )
+
         return SeqOutput(
             seq_id=item.seq_id,
             token_ids=committed,
             num_drafted=len(drafted),
             num_accepted=len(accepted),
         )
+
+    @property
+    def measured_acceptance(self) -> float:
+        """alpha as observed by this runner. 0.0 if speculation never ran."""
+        return self.spec_accepted / self.spec_drafted if self.spec_drafted else 0.0
 
 
 def build_runner(

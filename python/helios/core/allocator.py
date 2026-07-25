@@ -140,9 +140,26 @@ class Allocator:
         head_dim: int,
         n_layers: int,
         dtype_bytes: int = 2,
+        scale_bytes_per_token: int = 0,
     ) -> int:
-        """Spec section 5.2 sizing formula. Factor 2 is K and V."""
-        return 2 * block_size * n_kv_heads * head_dim * dtype_bytes * n_layers
+        """Spec section 5.2 sizing formula. Factor 2 is K and V.
+
+        `scale_bytes_per_token` accounts for a quantized cache's per-token,
+        per-head scale (exec.paged_attn.QuantizedPagedKVCache). It is zero for an
+        unquantized cache, so this reduces to the spec's formula exactly.
+
+        It belongs in the formula rather than being applied as a correction
+        afterwards: this number is what the engine divides its byte budget by to
+        get a block count, and if the divisor understates the true block cost the
+        engine hands out more blocks than the cache can hold.
+        """
+        return (
+            2
+            * n_layers
+            * block_size
+            * n_kv_heads
+            * (head_dim * dtype_bytes + scale_bytes_per_token)
+        )
 
     @classmethod
     def blocks_for_budget(
@@ -153,9 +170,11 @@ class Allocator:
         head_dim: int,
         n_layers: int,
         dtype_bytes: int = 2,
+        scale_bytes_per_token: int = 0,
     ) -> int:
         per = cls.bytes_per_block(
-            block_size, n_kv_heads, head_dim, n_layers, dtype_bytes
+            block_size, n_kv_heads, head_dim, n_layers, dtype_bytes,
+            scale_bytes_per_token,
         )
         return max(0, budget_bytes // per)
 

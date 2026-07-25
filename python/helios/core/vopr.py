@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .allocator import AllocError, Allocator, InvariantViolation
+from .disagg import TransferInvariantViolation
 from .execstep import (
     ExecFault,
     ExecOutputs,
@@ -201,6 +202,217 @@ class SimExecutor:
         return 1000 + (seq_id * 31 + n) % 5000
 
 
+class DisaggSimulator:
+    """Drives the KV transfer FSM under fault injection (spec section 6.4).
+
+    Models a decode partition's block pool and a prefill partition handing
+    sequences over to it. Faults come from the seeded RNG, so any failure replays
+    exactly.
+
+    The bug class this is aimed at is block accounting across a partial failure.
+    A transfer that dies between SENT and RECEIVED has blocks reserved on the
+    receiver that the sender does not know about, and blocks held on the sender
+    that the receiver cannot see. Getting that wrong leaks on one side, on the
+    other, or on both -- and leaks are invisible until the pool is exhausted,
+    which in a real deployment is hours later and looks like a capacity problem
+    rather than a correctness one.
+
+    Two things are asserted that the FSM cannot check by itself, because they
+    involve the pool it does not own:
+
+      P1. receiver_free + receiver_reserved == receiver_total, every step. A
+          reserved-but-forgotten block breaks this immediately.
+      P2. at quiescence, every block is either free or held by a committed
+          sequence. Nothing is in limbo.
+    """
+
+    def __init__(self, rng: random.Random, total_receiver_blocks: int) -> None:
+        from .disagg import DisaggConfig, KVTransferManager
+
+        self.rng = rng
+        self.total_receiver_blocks = total_receiver_blocks
+        self.free_receiver = set(range(total_receiver_blocks))
+        # Blocks belonging to sequences that completed their migration and are
+        # now decoding on the receiver. Freed when the sequence finishes.
+        self.landed: Dict[int, List[int]] = {}
+
+        self.manager = KVTransferManager(
+            DisaggConfig(
+                # Small on purpose: a link that never saturates never exercises
+                # queueing, and a generous timeout never exercises reaping.
+                link_bandwidth_bps=rng.choice([1e9, 12e9, 50e9]),
+                max_concurrent_transfers=rng.randint(1, 4),
+                transfer_timeout_steps=rng.randint(3, 20),
+                max_retries=rng.randint(0, 3),
+            )
+        )
+        self.next_seq = 0
+        self.reprefills = 0
+        self.oom_rejections = 0
+
+    def _alloc_receiver(self, n: int) -> Optional[List[int]]:
+        if len(self.free_receiver) < n:
+            return None
+        # Sorted, not popped arbitrarily: set iteration order is stable within a
+        # run but not across Python versions, and DST replay has to survive that.
+        blocks = sorted(self.free_receiver)[:n]
+        self.free_receiver.difference_update(blocks)
+        return blocks
+
+    def _release_receiver(self, blocks: List[int]) -> None:
+        for b in blocks:
+            if b in self.free_receiver:
+                raise TransferInvariantViolation(
+                    f"receiver block {b} was freed twice -- double release"
+                )
+            self.free_receiver.add(b)
+
+    def step(self, submit: bool) -> None:
+        from .disagg import TransferFault, TransferState
+
+        mgr = self.manager
+        rng = self.rng
+
+        # 1. A prefill finished; hand it over.
+        if submit:
+            n_blocks = rng.randint(1, 8)
+            src = [10_000 + self.next_seq * 8 + i for i in range(n_blocks)]
+            mgr.submit(self.next_seq, src, bytes_per_block=rng.choice([2**16, 2**20]))
+            self.next_seq += 1
+
+        # 2. Reserve destination blocks for queued transfers.
+        for t in [x for x in mgr.transfers.values() if x.state == TransferState.PENDING]:
+            dst = self._alloc_receiver(t.n_blocks)
+            if dst is None:
+                # Receiver is full. Not a failure yet -- it stays queued, which is
+                # the correct behaviour and also the shape of a potential livelock
+                # if nothing ever drains. The liveness check at the end is what
+                # would catch that.
+                self.oom_rejections += 1
+                if rng.random() < 0.2:
+                    src, d = mgr.fail(t, TransferFault.RECEIVER_OOM)
+                    self._release_receiver(d)
+                    if not mgr.retry(t):
+                        self.reprefills += 1
+                continue
+            mgr.reserve(t, dst)
+
+        # 3. Start what the link can carry.
+        for t in [x for x in mgr.transfers.values() if x.state == TransferState.RESERVED]:
+            if not mgr.can_begin():
+                break
+            mgr.begin(t)
+
+        # 4. Move bytes.
+        newly_sent = mgr.step()
+
+        # 5. Resolve each completed send: verified, corrupted, or ack lost.
+        for t in newly_sent:
+            r = rng.random()
+            if r < 0.05:
+                src, dst = mgr.fail(t, TransferFault.CHECKSUM_MISMATCH)
+                self._release_receiver(dst)
+                if not mgr.retry(t):
+                    self.reprefills += 1
+            elif r < 0.10:
+                # Ack lost: the receiver has the bytes but the sender never
+                # learns. Left in SENT deliberately so the timeout path is what
+                # resolves it -- that is the only mechanism that can.
+                pass
+            else:
+                mgr.acknowledge(t)
+
+        # 6. Commit acknowledged transfers; the sender's blocks are now free.
+        for t in [x for x in mgr.transfers.values() if x.state == TransferState.RECEIVED]:
+            mgr.commit(t)
+            self.landed[t.seq_id] = list(t.dst_blocks)
+
+        # 7. Reap timeouts.
+        for t in mgr.timed_out():
+            src, dst = mgr.fail(t, TransferFault.LINK_TIMEOUT)
+            self._release_receiver(dst)
+            if not mgr.retry(t):
+                self.reprefills += 1
+
+        # 8. Occasionally cancel a live transfer.
+        live = [x for x in mgr.transfers.values() if not x.is_terminal]
+        if live and rng.random() < 0.05:
+            t = live[rng.randrange(len(live))]
+            src, dst = mgr.abort(t)
+            self._release_receiver(dst)
+
+        # 9. Sequences finish decoding and give their blocks back.
+        for seq_id in list(self.landed):
+            if rng.random() < 0.25:
+                self._release_receiver(self.landed.pop(seq_id))
+
+        mgr.check_invariants()
+        self.check_pool_invariants()
+
+    def check_pool_invariants(self) -> None:
+        """P1: every receiver block is free, reserved by a live transfer, or landed."""
+        from .disagg import TransferState
+
+        reserved: Dict[int, int] = {}
+        for t in self.manager.transfers.values():
+            if t.state in (
+                TransferState.RESERVED, TransferState.SENDING,
+                TransferState.SENT, TransferState.RECEIVED,
+            ):
+                for b in t.dst_blocks:
+                    reserved[b] = t.transfer_id
+
+        landed_blocks = {b for blocks in self.landed.values() for b in blocks}
+        overlap = set(reserved) & landed_blocks
+        if overlap:
+            raise TransferInvariantViolation(
+                f"P1: blocks {sorted(overlap)[:8]} are both reserved for a live "
+                "transfer and held by a landed sequence"
+            )
+        double = (set(reserved) | landed_blocks) & self.free_receiver
+        if double:
+            raise TransferInvariantViolation(
+                f"P1: blocks {sorted(double)[:8]} are in the free list while "
+                "still owned"
+            )
+        total = len(self.free_receiver) + len(reserved) + len(landed_blocks)
+        if total != self.total_receiver_blocks:
+            raise TransferInvariantViolation(
+                f"P1: receiver blocks do not add up: free={len(self.free_receiver)} "
+                f"+ reserved={len(reserved)} + landed={len(landed_blocks)} "
+                f"= {total}, expected {self.total_receiver_blocks}"
+            )
+
+    def drain(self, max_steps: int = 500) -> List[str]:
+        """Run with no new submissions until quiescent. Returns any violations."""
+        for _ in range(max_steps):
+            if self.manager.n_active == 0:
+                break
+            try:
+                self.step(submit=False)
+            except TransferInvariantViolation as exc:
+                return [f"disagg drain: {exc}"]
+
+        out: List[str] = []
+        if self.manager.n_active:
+            # P2 as a liveness property: a transfer that can never be resolved is
+            # a hang, and the only reason one should survive a drain is a missing
+            # timeout path.
+            states = [t.state.value for t in self.manager.transfers.values() if not t.is_terminal]
+            out.append(
+                f"disagg liveness: {self.manager.n_active} transfers never reached "
+                f"a terminal state (states: {sorted(set(states))})"
+            )
+        for seq_id in list(self.landed):
+            self._release_receiver(self.landed.pop(seq_id))
+        if not out and len(self.free_receiver) != self.total_receiver_blocks:
+            out.append(
+                f"disagg leak: {self.total_receiver_blocks - len(self.free_receiver)} "
+                "receiver blocks were never returned"
+            )
+        return out
+
+
 @dataclass
 class SimWorkload:
     """One generated workload: arrivals, lengths, classes, cancellations."""
@@ -260,6 +472,16 @@ class Simulation:
         # Separate RNG stream so adding fork events cannot shift the
         # workload or fault schedules derived from the main stream.
         self.fork_rng = random.Random(seed ^ 0xF00D)
+
+        # Disaggregation runs on its own RNG stream for the same reason: adding
+        # it must not perturb any previously-verified seed's scheduler workload.
+        # Half the seeds exercise it, so the co-located path stays covered too.
+        self.disagg_rng = random.Random(seed ^ 0xD15A)
+        self.disagg: Optional[DisaggSimulator] = None
+        if adversarial and self.disagg_rng.random() < 0.5:
+            self.disagg = DisaggSimulator(
+                self.disagg_rng, total_receiver_blocks=self.disagg_rng.randint(8, 64)
+            )
 
         # Forked block tables held across steps (see _maybe_fork). These are a
         # harness artifact and are released before the leak check.
@@ -467,6 +689,16 @@ class Simulation:
 
             self._maybe_fork(step)
 
+            # KV transfers advance in lockstep with scheduler steps: the FSM is
+            # step-driven for the same reason the scheduler is, so that a
+            # simulated run is a total function of the seed (spec section 19.4).
+            if self.disagg is not None:
+                try:
+                    self.disagg.step(submit=self.disagg_rng.random() < 0.3)
+                except TransferInvariantViolation as exc:
+                    violations.append(f"step {step}: disagg: {exc}")
+                    break
+
             if self.check_every_step:
                 try:
                     self.scheduler.check_invariants()
@@ -527,6 +759,13 @@ class Simulation:
                     f"{orphaned[:8]}"
                 )
 
+        # Drain the transfer FSM to quiescence and check the same two properties
+        # there: everything terminal, and nothing leaked. A transfer stuck in SENT
+        # forever is the disaggregated analogue of a scheduler livelock.
+        if not violations and self.disagg is not None:
+            result.violations.extend(self.disagg.drain())
+            result.disagg_stats = self.disagg.manager.snapshot()
+
         return result
 
 
@@ -544,6 +783,7 @@ class SimResult:
     faults_raised: int = 0
     stats: Optional[object] = None
     sim_time_s: float = 0.0
+    disagg_stats: Optional[Dict[str, object]] = None
 
     @property
     def ok(self) -> bool:
@@ -551,11 +791,18 @@ class SimResult:
 
     def summary(self) -> str:
         status = "PASS" if self.ok else "FAIL"
+        extra = ""
+        if self.disagg_stats:
+            d = self.disagg_stats
+            extra = (
+                f" kvxfer={d['completed']}ok/{d['failed']}fail/"
+                f"{d['reprefill_fallbacks']}reprefill"
+            )
         return (
             f"[{status}] seed={self.seed} steps={self.steps} "
             f"reqs={self.submitted}/{self.requests} "
             f"finished={self.finished} aborted={self.aborted} "
-            f"faults={self.faults_raised}"
+            f"faults={self.faults_raised}{extra}"
         )
 
 

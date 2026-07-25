@@ -115,6 +115,136 @@ class PagedKVCache:
         self.v_cache[dst].copy_(self.v_cache[src])
 
 
+class QuantizedPagedKVCache(PagedKVCache):
+    """INT8 paged KV storage with per-token, per-head scales (spec section 7.4).
+
+    Drop-in for PagedKVCache: `write` quantizes, `gather` dequantizes, so every
+    attention path above is unchanged and stays fp. That is the point of a
+    "quantized shadow" -- the *storage* shrinks, the *math* does not move.
+
+    Granularity is per (block, head, token): one fp scale for each token's
+    head_dim-length key vector. Coarser (per-tensor, as vLLM's fp8 KV uses) is
+    cheaper to store but attention is a dot product over head_dim, so a single
+    outlier token's magnitude would set the scale for every token that shares it.
+    Per-token costs 2 bytes per (token, head) against head_dim bytes of payload,
+    which at head_dim=64 is a 3% overhead for a much tighter fit.
+
+    Symmetric rather than asymmetric: keys and values are near-centred, and a
+    zero point would have to be carried through the score matmul as an extra
+    correction term rather than folding into a single multiply.
+
+    Why bother: the KV cache, not the weights, is what limits concurrency at
+    long context. Halving it doubles the number of resident sequences at the same
+    byte budget, and the batched-decode win is proportional to that batch size.
+    The cost is accuracy, bounded and measured by tests/quant/test_kv_quant.py.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype = torch.float32,
+        device: str = "cpu",
+    ) -> None:
+        # Deliberately does NOT call super().__init__: that would allocate the fp
+        # tensors this class exists to avoid.
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.dtype = dtype          # the dtype gather() returns, not the storage
+        self.device = device
+
+        shape = (num_blocks, n_kv_heads, block_size, head_dim)
+        self.k_cache = torch.zeros(shape, dtype=torch.int8, device=device)
+        self.v_cache = torch.zeros(shape, dtype=torch.int8, device=device)
+        # Scale storage is fp16 regardless of compute dtype: a per-token scale is
+        # a magnitude, and fp16's 10-bit mantissa is far more precision than an
+        # int8 range needs.
+        sshape = (num_blocks, n_kv_heads, block_size)
+        self.k_scale = torch.ones(sshape, dtype=torch.float16, device=device)
+        self.v_scale = torch.ones(sshape, dtype=torch.float16, device=device)
+
+    @property
+    def nbytes(self) -> int:
+        return 2 * (
+            self.k_cache.numel() * self.k_cache.element_size()
+            + self.k_scale.numel() * self.k_scale.element_size()
+        )
+
+    @staticmethod
+    def _quantize(x: torch.Tensor):
+        """x: [n_tokens, n_heads, head_dim] -> (int8, scale [n_tokens, n_heads])."""
+        absmax = x.abs().amax(dim=-1).clamp(min=1e-8)
+        scale = absmax / 127.0
+        q = torch.round(x / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+        return q, scale
+
+    def write(
+        self,
+        block_ids: List[int],
+        start_pos: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        n_tokens = k.shape[0]
+        if n_tokens == 0:
+            return
+        kq, ks = self._quantize(k.float())
+        vq, vs = self._quantize(v.float())
+
+        for i in range(n_tokens):
+            pos = start_pos + i
+            logical_block = pos // self.block_size
+            offset = pos % self.block_size
+            if logical_block >= len(block_ids):
+                raise IndexError(
+                    f"position {pos} needs logical block {logical_block} but the "
+                    f"sequence has only {len(block_ids)} blocks"
+                )
+            phys = block_ids[logical_block]
+            self.k_cache[phys, :, offset, :] = kq[i]
+            self.v_cache[phys, :, offset, :] = vq[i]
+            self.k_scale[phys, :, offset] = ks[i].to(torch.float16)
+            self.v_scale[phys, :, offset] = vs[i].to(torch.float16)
+
+    def gather(self, block_ids: List[int], context_len: int) -> tuple:
+        if context_len == 0:
+            empty = torch.zeros(
+                (0, self.n_kv_heads, self.head_dim), dtype=self.dtype, device=self.device
+            )
+            return empty, empty
+
+        n_blocks = (context_len + self.block_size - 1) // self.block_size
+        if n_blocks > len(block_ids):
+            raise IndexError(
+                f"context_len {context_len} needs {n_blocks} blocks, have {len(block_ids)}"
+            )
+
+        idx = torch.tensor(block_ids[:n_blocks], dtype=torch.long, device=self.device)
+
+        def deq(cache, scales):
+            q = cache[idx].permute(0, 2, 1, 3).reshape(-1, self.n_kv_heads, self.head_dim)
+            s = scales[idx].permute(0, 2, 1).reshape(-1, self.n_kv_heads)
+            return (q[:context_len].float() * s[:context_len].float().unsqueeze(-1)).to(
+                self.dtype
+            )
+
+        return deq(self.k_cache, self.k_scale), deq(self.v_cache, self.v_scale)
+
+    def copy_block(self, src: int, dst: int) -> None:
+        self.k_cache[dst].copy_(self.k_cache[src])
+        self.v_cache[dst].copy_(self.v_cache[src])
+        # The scales are as much a part of the block as the payload. Forgetting
+        # them would leave the copy holding the destination's old magnitudes
+        # against the source's quantized values -- a copy-on-write that produces
+        # numerically wrong attention rather than an obvious crash.
+        self.k_scale[dst].copy_(self.k_scale[src])
+        self.v_scale[dst].copy_(self.v_scale[src])
+
+
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand KV heads to match query heads for grouped-query attention.
 

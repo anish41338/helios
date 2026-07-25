@@ -1,0 +1,72 @@
+{
+  "model": "artifacts\\qwen05b",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "gamma": 4,
+  "group_size": 128,
+  "awq": false,
+  "toy": false,
+  "n_prompts": 8,
+  "max_new_tokens": 32,
+  "elapsed_s": 761.92,
+  "quant_report": {
+    "n_layers_quantized": 168,
+    "weight_compression": 7.416,
+    "model_compression": 1.966
+  },
+  "memory": {
+    "target_bytes": 2520669696,
+    "draft_bytes": 1282364928,
+    "total_bytes": 3803034624,
+    "overhead_ratio": 1.5087,
+    "draft_alone_compression": 1.9656
+  },
+  "awq_effect": null,
+  "verdict": {
+    "alpha": 0.6859756097560976,
+    "drafted": 328,
+    "accepted": 225,
+    "measured_tokens_per_pass": 3.1707317073170733,
+    "kill_threshold": 0.6,
+    "passes_gate": true,
+    "best_gamma": 2,
+    "modelled_speedup_at_best_gamma": 1.4376920979575651,
+    "run_lengths": {
+      "0": 14,
+      "1": 12,
+      "2": 2,
+      "3": 7,
+      "4": 47
+    }
+  },
+  "modelled_speedup": {
+    "1": {
+      "alpha": 0.6859756097560976,
+      "gamma": 1,
+      "expected_tokens_per_pass": 1.6859756097560974,
+      "cost_per_pass": 1.25,
+      "speedup": 1.348780487804878
+    },
+    "2": {
+      "alpha": 0.6859756097560976,
+      "gamma": 2,
+      "expected_tokens_per_pass": 2.156538146936348,
+      "cost_per_pass": 1.5,
+      "speedup": 1.4376920979575651
+    },
+    "4": {
+      "alpha": 0.6859756097560976,
+      "gamma": 4,
+      "expected_tokens_per_pass": 2.70076167170446,
+      "cost_per_pass": 2.0,
+      "speedup": 1.35038083585223
+    },
+    "8": {
+      "alpha": 0.6859756097560976,
+      "gamma": 8,
+      "expected_tokens_per_pass": 3.0773598003613123,
+      "cost_per_pass": 3.0,
+      "speedup": 1.0257866001204374
+    }
+  }
+}

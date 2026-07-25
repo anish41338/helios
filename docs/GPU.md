@@ -49,12 +49,35 @@ did not catch any of them.**
 | Item | Status | Unlocked by a T4? |
 |---|---|---|
 | Triton paged-attention kernel | **VERIFIED on T4: 5.26x**, 9/9 tests | done |
-| W4A16 / AWQ quantization | not written | **Yes** |
 | Real model, meaningful absolute tok/s | **VERIFIED**: Qwen2.5-0.5B generates coherent text in fp16 | done |
-| vLLM baseline | not written | **Yes** |
-| QASSD α measurement (the §14 kill gate) | not written | **Yes** — a few hours |
+| W4A16 / AWQ quantization | **Built.** Numerically verified on CPU: 3.8× vs fp16, AWQ 1.58× lower layer error | Only the *speedup* — see below |
+| QASSD α measurement (the §14 kill gate) | **DONE on CPU: α = 0.6548, gate PASS.** α is a property of two weight matrices, so it did not need a GPU | already answered |
+| INT8 quantized KV cache | **Built.** 1.94× smaller, 2.31× more resident sequences measured | Only the *throughput* win |
+| Fused int4 GEMM | not written | **Yes** — this is the last piece between α and a real speedup |
+| vLLM baseline | **written, never run** (`bench/vllm_baseline.py`) | **Yes** |
+| α on a 7B model | not measured | **Yes** — needs the memory, not the method |
 | W4A4 draft path | not written | **No** — T4 has no fast int4 path, so the draft would not be cheaper than the verify and the premise fails |
-| Prefill/decode disaggregation | not written | Only on Kaggle's **2×T4** |
+| Prefill/decode disaggregation transport | FSM built and DST-verified; transport simulated | Only on Kaggle's **2×T4** |
+
+### What the CPU could and could not settle about quantization
+
+The scoping decision that changed: "quantization needs a GPU" conflated a *speed*
+claim with a *numerical* one.
+
+- The **numerical** half is device-independent arithmetic and was fully settled
+  here — compression ratios, error bounds, AWQ versus RTN, and most importantly
+  **α = 0.6548**, the acceptance rate the whole QASSD design rests on. A GPU would
+  not have made that number any more true.
+- The **speed** half genuinely needs one. `QuantLinear` dequantizes and then calls
+  a normal GEMM, so on CPU it is *slower* than fp32 — real work, no bandwidth wall
+  to relieve. Every quantization speedup in this repo is labelled **modelled**.
+
+The INT8 KV cache shows the split cleanly: **2.31× more resident sequences and
+1.62× better TTFT** (both measured, in a pool small enough to bind), and **27%
+worse throughput**, because dequantization costs more than it saves when the KV
+read is not the bottleneck. On a T4 it should be — that is a prediction from the
+same roofline argument that correctly predicted the GPU/CPU pattern in the
+ablation table, and it is the next thing worth measuring.
 
 ## Step 1 — Kaggle session setup
 
@@ -115,16 +138,24 @@ recoverable once it is on a résumé.
   entry point precisely so a dropped session costs one re-run, not a lost
   workflow.
 
-## After the kernel: suggested order
+## Next, in dependency order
 
-1. **W4A16 AWQ** loading + GEMM, then re-run the ablation suite. Real memory
-   win → higher concurrency, which the existing harness will show.
-2. **vLLM baseline** on the same model and hardware. This is the comparison the
-   spec asks for and the one an interviewer will ask about.
-3. **Measure α** for speculation on a 1B model. This is a *kill gate*, not a
-   build: spec section 14 says abandon QASSD if α < 0.6. Deciding not to build it,
-   with a measurement behind the decision, is a better outcome than building it
-   badly.
-4. **Disaggregation** across the 2×T4 — only if 1–3 land. The KV transfer FSM's
-   fault taxonomy already exists in the DST harness, so it has a test target
-   waiting.
+1. **A fused int4 GEMM** (Triton, dequant in the epilogue so fp weights are never
+   materialised). The single item standing between the measured α and a real
+   speedup claim. The correctness oracle already exists — `QuantLinear`'s
+   dequantize-then-GEMM path is pinned by `tests/quant/test_quant.py` — so this is
+   a kernel with a reference waiting for it, exactly as the attention kernel was.
+2. **Re-run the INT8 KV ablation on the T4.** The concurrency win is already
+   measured (2.31×); what is unknown is whether halving the KV read pays for the
+   dequantization once bandwidth is the binding constraint. A clean yes or no.
+3. **vLLM baseline** on the same model and hardware. `bench/vllm_baseline.py` is
+   written with the controls matched — same model dir, dtype, KV byte budget,
+   seeded arrival trace, discarded warm-up — and designed so that losing is a
+   reportable outcome. This is the comparison an interviewer reaches for.
+4. **α on a 7B model.** The 0.5B result clears the gate but misses the 0.78
+   target. Quantization error at fixed bit-width falls with model size, so a larger
+   model should do better — untested, and not claimed. Needs GPU *memory* rather
+   than GPU speed.
+5. **Disaggregation** across the 2×T4 — only if 1–4 land. The FSM, the fault
+   taxonomy, and the block accounting are already built and DST-verified, so this
+   is transport plumbing against a test target that already exists.

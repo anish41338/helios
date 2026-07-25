@@ -1,0 +1,76 @@
+{
+  "model": "artifacts\\qwen05b",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "gamma": 4,
+  "group_size": 128,
+  "awq": true,
+  "toy": false,
+  "n_prompts": 8,
+  "max_new_tokens": 32,
+  "elapsed_s": 345.87,
+  "quant_report": {
+    "n_layers_quantized": 168,
+    "weight_compression": 7.378,
+    "model_compression": 1.964
+  },
+  "memory": {
+    "target_bytes": 2520669696,
+    "draft_bytes": 1283347968,
+    "total_bytes": 3804017664,
+    "overhead_ratio": 1.5091,
+    "draft_alone_compression": 1.9641
+  },
+  "awq_effect": {
+    "mean_rel_output_err_rtn": 0.011673245853411831,
+    "mean_rel_output_err_awq": 0.007394051567557437,
+    "error_reduction": 1.5787347094832327
+  },
+  "verdict": {
+    "alpha": 0.6547619047619048,
+    "drafted": 336,
+    "accepted": 220,
+    "measured_tokens_per_pass": 3.119047619047619,
+    "kill_threshold": 0.6,
+    "passes_gate": true,
+    "best_gamma": 2,
+    "modelled_speedup_at_best_gamma": 1.3889833711262283,
+    "run_lengths": {
+      "0": 15,
+      "1": 11,
+      "2": 7,
+      "3": 9,
+      "4": 42
+    }
+  },
+  "modelled_speedup": {
+    "1": {
+      "alpha": 0.6547619047619048,
+      "gamma": 1,
+      "expected_tokens_per_pass": 1.6547619047619049,
+      "cost_per_pass": 1.25,
+      "speedup": 1.323809523809524
+    },
+    "2": {
+      "alpha": 0.6547619047619048,
+      "gamma": 2,
+      "expected_tokens_per_pass": 2.0834750566893425,
+      "cost_per_pass": 1.5,
+      "speedup": 1.3889833711262283
+    },
+    "4": {
+      "alpha": 0.6547619047619048,
+      "gamma": 4,
+      "expected_tokens_per_pass": 2.5479750632773897,
+      "cost_per_pass": 2.0,
+      "speedup": 1.2739875316386948
+    },
+    "8": {
+      "alpha": 0.6547619047619048,
+      "gamma": 8,
+      "expected_tokens_per_pass": 2.8324850883851336,
+      "cost_per_pass": 3.0,
+      "speedup": 0.9441616961283779
+    }
+  }
+}

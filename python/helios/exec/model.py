@@ -393,14 +393,22 @@ class DecoderLayer(torch.nn.Module):
 
 
 class HeliosModel(torch.nn.Module):
-    """The full causal LM, driven one sequence at a time by the runner.
+    """The full causal LM. Two entry points, and the difference matters.
 
-    Sequences are processed individually rather than as a padded batch. That is
-    a deliberate simplification of this build: correct paged KV handling per
-    sequence comes first, and batched paged attention is a kernel-level
-    optimisation the CPU fallback cannot exploit anyway. The scheduler already
-    produces properly batched ExecSteps, so batching the executor later requires
-    no scheduler change.
+    `forward` runs ONE sequence. `forward_batched` runs many in a single pass, by
+    concatenating them along the token dimension so every projection and the MLP
+    become one large GEMM while attention stays per-sequence over its own paged KV.
+    The production path is `forward_batched`; `forward` remains because it is the
+    reference the batched path is pinned against, and because the speculative
+    draft loop is inherently serial.
+
+    An earlier version of this class had only the per-sequence path, and this
+    docstring argued that batching was "a kernel-level optimisation the CPU
+    fallback cannot exploit anyway". That was wrong -- batching the GEMMs is worth
+    ~10x on CPU at 32 sequences, and the engine's measured batching win went from
+    nothing to 2.24x with no hardware change. The note is left here because the
+    mistake was a reasoning error about where a bottleneck was, not a missing
+    feature, and those are the expensive kind.
     """
 
     def __init__(self, config: ModelConfig, device: str = "cpu") -> None:

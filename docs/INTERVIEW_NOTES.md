@@ -153,8 +153,36 @@ compute directly displaces useful work. Hence `spec_max_batch_size = 8`.
 The draft path reads stale KV for the rejected positions, so its proposals get
 worse, α collapses, and speedup silently vanishes — while output stays *correct*
 because the verifier still decides. It presents as a performance regression, not a
-bug, which is why it's expensive to find. Spec §7.4 flags it; in this build there
-is no quantized shadow to desynchronise (see `QASSD.md`).
+bug, which is why it's expensive to find. Spec §7.4 flags it, and this build has
+exactly that hazard: the draft writes keys for every token it proposes, and past
+the first rejection those describe a continuation that was thrown away. Paged
+storage has no notion of truncation, so nothing catches it. `_run_speculative`
+re-syncs the draft's KV over the committed span for precisely this reason.
+
+**So what is α, actually?**
+**0.6548**, measured on Qwen2.5-0.5B with an int4 AWQ draft against fp32 verify
+(336 drafted, 220 accepted, 84 verify passes). Have the follow-ups ready, because
+this number invites them:
+
+- *The gate passed but the target didn't.* Pre-committed kill threshold was 0.60;
+  spec §7.3's target was 0.78. So the feature ships and is worth less than planned.
+- *Optimal γ is 2, not 4.* And at γ=8 the modelled speedup is **0.94× — a net
+  loss**, because a rejection discards every drafted token after it.
+- *It costs +51% weight memory*, not −75%. Both precisions must be resident.
+  "4-bit quantization" sounding like a saving is the easiest misreading here.
+- *Why is measuring this on a CPU legitimate?* α is the probability that two weight
+  matrices produce the same argmax on the same context. It is arithmetic, not
+  throughput, so it transfers to a GPU unchanged. The *speedup* does not — there is
+  no int4 GEMM here, so every speedup figure is labelled modelled.
+
+**The histogram falsified the model's own assumption.**
+Accepted-run lengths are strongly bimodal: 42 of 84 passes accepted all four
+tokens, 15 accepted none. So acceptances are positively *correlated* — a context
+the draft finds easy stays easy — which violates the independence assumption in the
+speedup formula above. The error is in the safe direction: measured tokens per pass
+was **3.12** against 2.55 predicted, so the textbook model *understates* the value
+by 22%. Being able to say which way a model's assumption fails is more useful than
+quoting the model.
 
 ---
 
@@ -178,23 +206,80 @@ metadata-heavy.
 From the observation that a small fraction of weight *channels* matter far more
 because they multiply large-magnitude activations. AWQ uses activation statistics
 from calibration data to pick per-channel scalings that protect those salient
-channels before quantizing — it is not weight magnitude alone.
+channels before quantizing — it is not weight magnitude alone. The identity that
+makes it free in exact arithmetic: `(x/s) @ (W·s)ᵀ = x @ Wᵀ` for any positive `s`,
+so scaling only moves *where* the quantization error lands.
 
-**Not implemented here.** No AWQ/GPTQ loading, no int4 kernels. Answering these
-is reading, not experience, and it should be presented that way.
+**Implemented, and here is the null result.**
+AWQ measures **1.58× lower** mean per-layer output error than round-to-nearest
+across 168 layers. And α comes out at 0.6548 with AWQ against **0.6860** with
+plain RTN — nominally *worse*. Bootstrapping over verify passes (the unit of
+independence, since acceptances are correlated) and running a permutation test
+gives **p = 0.64**: indistinguishable at this sample size.
+
+The interesting part is the explanation, offered as a hypothesis: **objective
+mismatch.** AWQ minimises `‖(W_q − W)x‖²` — output fidelity. Acceptance depends
+only on whether the **argmax** survives, which is far coarser. A method can cut
+MSE substantially while flipping near-ties in the logits either way, and only the
+flips cost acceptance. That does not make AWQ wrong for standalone W4A16 serving,
+where fidelity *is* the objective. It says the calibration target for a
+speculative *draft* should be top-1 agreement with the target model — which is a
+concrete follow-up, not a conclusion.
+
+**What about the KV cache?**
+INT8 with per-token, per-head symmetric scales: **1.94× smaller** than fp16.
+Per-token rather than per-tensor because attention is a dot product over head_dim,
+so one outlier token would otherwise set the scale for every token sharing it.
+Symmetric rather than asymmetric because a zero point would have to be carried
+through the score matmul as a correction term instead of folding into one multiply.
+
+Measured in a pool small enough to bind: **2.31× more resident sequences, 1.62×
+better TTFT — and 27% worse throughput**, because on a CPU the dequantization is
+real work with no bandwidth wall to relieve. Volunteer that number; the GPU
+prediction (that halving the KV read more than pays for it when bandwidth *is* the
+bottleneck) is a prediction, not a result.
+
+**Still not implemented:** a fused int4 GEMM. `QuantLinear` dequantizes and calls a
+normal GEMM, so on CPU it is *slower* than fp32. Every quantization speedup in the
+repo is labelled modelled. Say this before being asked.
 
 ---
 
 ## Disaggregation
 
-**Not built** — needs ≥2 devices; this machine has none. The design questions
-(why split phases: the arithmetic-intensity argument above; how to hide transfer
-cost: start copying layer *l*'s KV as soon as layer *l* finishes prefill, so PCIe
-overlaps remaining compute; why pipeline rather than tensor parallel without
-NVLink: tensor parallel needs an all-reduce every layer and degrades to the
-interconnect, while pipeline parallel only passes activations at stage
-boundaries) are spec §6.4, not results. The DST harness models the transfer FSM's
-*fault kinds* but the transport itself is untested.
+**The FSM is built and verified; the transport is simulated** — there is one
+device. Be precise about which half that is, because the half that is built is the
+half where the bugs are.
+
+**Why a state machine rather than async/await?**
+Because the design has to distinguish `SENT` (the sender believes it is done) from
+`RECEIVED` (the receiver confirms). Every interesting fault lives in that gap, and
+an await collapses it — making "sender finished, receiver never acknowledged"
+*unrepresentable* and therefore untestable. Seven states, an explicit legal-
+transition table, and an unlisted edge raises.
+
+**Name the failure mode that motivates it.**
+A transfer that dies between `SENT` and `RECEIVED` has blocks reserved on the
+receiver that the sender does not know about, and blocks pinned on the sender the
+receiver cannot see. Handle one side and you leak the other — invisible until the
+pool is exhausted, at which point it looks like a capacity problem. Two rules fall
+out: the sender may not release until the receiver confirms (or a lost ack becomes
+unrecoverable rather than merely slow), and a client abort after the bytes are on
+the wire must resolve as a *failure* rather than an abort.
+
+**Is transferring even the right call?**
+Not always, and this is the answer worth having. A 2000-token prompt on a 32-layer
+model with 8 KV heads at head_dim 128 in fp16 is **262 MB**. Re-prefilling it at
+8000 tok/s costs 250 ms. So transferring wins by ~11× over PCIe 3.0 and *loses*
+over 10 GbE — the crossover is at the machine boundary, not inside it. A design
+that always transferred would be strictly worse than no disaggregation at all on
+the wrong side of that line, which is why it is computed from bandwidth.
+
+**How would you hide the transfer cost?** Start copying layer *l*'s KV as soon as
+layer *l* finishes prefill, so the interconnect overlaps the remaining compute.
+And why pipeline rather than tensor parallel without NVLink: tensor parallel needs
+an all-reduce every layer and degrades to the interconnect, while pipeline parallel
+passes activations only at stage boundaries.
 
 ---
 
@@ -237,22 +322,50 @@ exposing a pin leak underneath it.
 ## Honest weaknesses to volunteer
 
 - **Where vLLM wins:** kernel maturity, CUDA graphs, FlashInfer/FlashAttention
-  integration, years of tuning, real batched paged attention, broad quantization
-  support, multi-GPU. This build has none of that and does not compare itself to
-  vLLM anywhere.
-- **What I didn't build:** Rust, CUDA/Triton kernels, quantization,
-  prefill/decode disaggregation, the quantization asymmetry that is QASSD's whole
-  claim to novelty, 70B pipeline parallel, a vLLM baseline. All enumerated in
-  `SCOPE.md`.
-- **What my numbers do not prove:** nothing about GPU performance, nothing about
-  quantized inference, and nothing about α for QASSD. The batching and prefix-cache
-  ratios are real but CPU-and-toy-model bound; they show the mechanisms work, not
-  what they would do on a 4090 against vLLM.
+  integration, years of tuning, broad quantization support, multi-GPU. This build
+  has one Triton kernel and a Python hot path, and it does not compare itself to
+  vLLM anywhere. The baseline harness is *written* with matched controls
+  (`bench/vllm_baseline.py`) and has **never been run** — it needs CUDA.
+- **No fused int4 GEMM.** The quantization is numerically real and verified; the
+  speedup is not. `QuantLinear` dequantizes then calls a normal GEMM, so on CPU it
+  is *slower* than fp32. Every quantization speedup figure in the repo is labelled
+  **modelled**. This is the single largest gap and it should be stated first.
+- **Disaggregation transport is simulated.** The FSM, the fault taxonomy, the block
+  accounting, and the transfer-versus-recompute decision are built and verified
+  across thousands of seeds. Moving actual bytes between actual devices is not.
+- **What I didn't build at all:** Rust, W4A4 (the T4 has no fast int4 activation
+  path, so the premise fails on available hardware), 70B pipeline parallel. All
+  enumerated in `SCOPE.md`.
+- **What the CPU numbers do not prove:** nothing about absolute GPU throughput. The
+  model is a random-weight toy, so tokens/second is meaningless; the *ratios between
+  ablations* are the result. What makes the correctness claim credible instead is
+  coherent text from Qwen2.5-0.5B on a T4 — a toy model can only ever demonstrate
+  self-consistency, since an error shared by the code and its own reference passes
+  every such test.
+- **α is marginal, and on a small model.** 0.6548 clears the 0.60 gate and misses
+  the 0.78 target. The hypothesis that it improves with model scale (quantization
+  error at fixed bit-width falls as models get more redundant) is **untested and not
+  claimed**.
 - **A conclusion I got wrong and corrected:** I documented "continuous batching
   needs a GPU to pay" as a finding. It was a missing optimisation in my own
-  executor. Worth volunteering, because the interesting question is not whether I
-  hit the target but whether my measurements could tell me when I was wrong — and
-  initially they could not.
+  executor — batching the GEMMs gave 2.24× with no hardware change. Worth
+  volunteering, because the interesting question is not whether I hit the target but
+  whether my measurements could tell me when I was wrong, and initially they could
+  not. The generalisation I now apply: **a negative result about hardware deserves
+  more suspicion than a negative result about code**, because it is unfalsifiable
+  from where you are standing.
+- **An arithmetic error in a comment that inverted a conclusion.** I put a
+  2000-token KV cache at 2.6 GB when it is 262 MB — a factor of ten, which flipped
+  the PCIe verdict from "transfer wins by 11×" to "roughly break-even". Caught by a
+  test written against the real formula, not by re-reading the comment. A number in
+  prose is still a claim with no reproduction behind it.
+- **Three GPU bugs that 178 passing tests did not catch**, and three of the four
+  were structurally invisible on a CPU-only machine: dropped Qwen2 attention biases
+  (the toy model is written by the same code that reads it), weights never moved to
+  the device (`.to(dtype)` is not `.to(device)`, and the two coincide with one
+  device), and the executor converting the resulting exception into a retryable
+  fault so the only symptom was an empty list. The regression tests assert the
+  *invariant*, not the symptom, because the symptom is unobservable where they run.
 - **What they do support:** the mechanisms are implemented and verified correct
   (bit-exact parity on chunked prefill, speculation, and paged vs dense
   attention), and the scheduler survives 50,000 adversarial simulated runs with
