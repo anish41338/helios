@@ -74,9 +74,36 @@ would have found almost none of them. Highlights:
 
 Full writeup with root causes and reproductions: [docs/DST.md](docs/DST.md).
 
+## It serves real models
+
+Verified on a Tesla T4 in fp16 with Qwen2.5-0.5B:
+
+```
+"The capital of France is"  ->  " Paris. It is the largest city in Europe and the
+                                 second largest in the world..."
+"def add(a, b):"            ->  "
+    return a + b
+
+def subtract(a, b):
+                                 
+    return a - b
+
+def multiply(a,"
+```
+
+Paging, block tables, RoPE, GQA, RMSNorm, SwiGLU, batched prefill, batched decode,
+fp16 numerics and sampling all have to be right at once for that to come out. The
+toy model used by the test suite has random weights, so it proves
+self-consistency but could never catch an error shared by the implementation and
+its own reference. This does.
+
+```bash
+python bench/real_model_check.py --model artifacts/qwen05b --device cuda
+```
+
 ## Correctness
 
-176 tests (+9 GPU-only). The parity tests are the backbone, per spec §13.1 and §19.2 (a
+178 tests (+9 GPU-only). The parity tests are the backbone, per spec §13.1 and §19.2 (a
 tolerance is never loosened to make a test pass):
 
 | Property | Guarantee |

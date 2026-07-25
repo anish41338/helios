@@ -44,6 +44,7 @@ could never be compiled, run, or benchmarked here.
 | Self-speculative decode structure + accept/rollback | 7.2 | Built (see caveat below) |
 | Adaptive speculation gating | 7.3 | Built (batch size + measured acceptance) |
 | Deterministic simulation testing | 10 | Built. Seed sweeps, fault injection, replay |
+| **Serving a real pretrained model** | 8.1 | **Verified on T4: Qwen2.5-0.5B generates coherent text in fp16** |
 | OpenAI-compatible HTTP API | 9.1 | Built (`/v1/completions`, `/v1/chat/completions`) |
 | Prometheus metrics | 9.2 | Built |
 | Benchmark harness + ablations | 11 | Built (Poisson arrivals, percentiles, goodput) |
@@ -81,6 +82,43 @@ quantized path. So:
 What it does establish: the scheduler's accept/rollback bookkeeping and KV
 truncation are correct, which is the part most likely to silently corrupt
 output. The quantization asymmetry that would make it fast is future work.
+
+## End-to-end verification on real weights
+
+The strongest single correctness result in this repo. On a Tesla T4, fp16,
+Qwen2.5-0.5B (630M params as loaded -- 494M plus the untied `lm_head` copy):
+
+```
+"The capital of France is"  ->  " Paris. It is the largest city in Europe and the
+                                 second largest in the world..."
+"Water boils at"            ->  " 212 F and ice melts at 32 F. What is the number
+                                 of degrees by which the water..."
+"def add(a, b):"            ->  "
+    return a + b
+
+def subtract(a, b):
+                                 
+    return a - b
+
+def multiply(a,"
+```
+
+Why this matters more than any benchmark: paging, block tables, RoPE (rotate-half
+convention), GQA head expansion, RMSNorm, SwiGLU, batched prefill, batched decode,
+fp16 numerics, and sampling must **all** be simultaneously correct for a
+pretrained model to produce this. The toy model in `tests/` has random weights, so
+it can only ever prove self-consistency -- a systematic error shared by the code
+under test and its reference would pass every one of those tests. This cannot.
+
+Note the content is the 0.5B model's own knowledge, not a claim about the engine:
+Paris is not the largest city in Europe. Fluency and structure are what is being
+verified, not factuality.
+
+Reproduce:
+
+```bash
+python bench/real_model_check.py --model artifacts/qwen05b --device cuda
+```
 
 ## Batched decode (what the throughput claim rests on)
 
